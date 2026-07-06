@@ -20,7 +20,7 @@ from .todo_store import (
     TodoReminder,
     TodoReminderDraft,
     TodoStore,
-    resolve_pending_target,
+    parse_pending_target_number,
 )
 
 
@@ -510,10 +510,10 @@ class TodoReminderPlugin(NcatBotPlugin):
             找到时返回待办记录，否则返回 None。
         """
 
-        if not target.strip():
+        todo_no = parse_pending_target_number(target)
+        if todo_no is None:
             return None
-        items = self.store.list_pending(scope, group_id, user_id, limit=100)
-        return resolve_pending_target(items, target)
+        return self.store.find_pending_by_no(scope, group_id, user_id, todo_no)
 
     def _format_pending_list(self, items: list[TodoReminder]) -> str:
         """格式化未完成待办列表的群/私聊回复文本。

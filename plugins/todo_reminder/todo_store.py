@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -21,7 +21,11 @@ MODE_CATGIRL = "catgirl"
 
 @dataclass(frozen=True)
 class TodoReminderDraft:
-    """创建待办前的结构化草稿。"""
+    """创建待办前的结构化草稿。
+
+    只保存用户想创建的待办内容，还没有数据库主键、展示序号、来源范围、
+    状态或创建时间。写入数据库后会转换为 TodoReminder。
+    """
 
     title: str
     content: str | None
@@ -34,7 +38,11 @@ class TodoReminderDraft:
 
 @dataclass(frozen=True)
 class TodoReminder:
-    """已持久化的待办提醒记录。"""
+    """已持久化的待办提醒记录。
+
+    表示数据库中已经存在的一条完整待办，包含数据库主键、展示序号、
+    来源范围、状态、创建时间和提醒状态等持久化字段。
+    """
 
     id: int
     todo_no: int
@@ -129,29 +137,6 @@ class TodoStore:
             ).fetchone()
         return int(row[0] if row else 0)
 
-    def create(
-        self,
-        scope: str,
-        group_id: str | None,
-        user_id: str,
-        draft: TodoReminderDraft,
-        now: int,
-    ) -> TodoReminder:
-        """创建一条待办提醒记录。
-
-        Args:
-            scope: 待办来源范围，取值为 `group` 或 `private`。
-            group_id: 群号；私聊待办传入 None。
-            user_id: 创建人 QQ 号。
-            draft: 已通过 LLM 解析和校验的待办草稿。
-            now: 创建时间的 Unix 秒级时间戳。
-
-        Returns:
-            创建后的完整待办记录。
-        """
-
-        return self.create_many(scope, group_id, user_id, [draft], now)[0]
-
     def create_many(
         self,
         scope: str,
@@ -224,13 +209,14 @@ class TodoStore:
                 used_todo_numbers.add(todo_no)
 
             placeholders = ",".join("?" for _ in todo_ids)
-            row = conn.execute(
+            rows = conn.execute(
                 f"SELECT * FROM todo_reminders WHERE id IN ({placeholders}) ORDER BY id ASC",
                 todo_ids,
             ).fetchall()
-        if len(row) != len(todo_ids):
+        if len(rows) != len(todo_ids):
             raise RuntimeError("todo disappeared after insert")
-        return [_row_to_todo(item) for item in row]
+        todos_by_id = {int(row["id"]): _row_to_todo(row) for row in rows}
+        return [todos_by_id[todo_id] for todo_id in todo_ids]
 
     def list_pending(
         self,
@@ -266,6 +252,43 @@ class TodoStore:
                 (scope, group_id, user_id, STATUS_OPEN, int(limit)),
             ).fetchall()
         return [_row_to_todo(row) for row in rows]
+
+    def find_pending_by_no(
+        self,
+        scope: str,
+        group_id: str | None,
+        user_id: str,
+        todo_no: int,
+    ) -> TodoReminder | None:
+        """按当前范围内的待办序号查找一条未完成待办。
+
+        Args:
+            scope: 待办来源范围，取值为 `group` 或 `private`。
+            group_id: 群号；私聊待办传入 None。
+            user_id: 创建人 QQ 号。
+            todo_no: 当前范围内展示给用户的待办序号。
+
+        Returns:
+            匹配到的未完成待办；没有匹配时返回 None。
+        """
+
+        if todo_no <= 0:
+            return None
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT *
+                FROM todo_reminders
+                WHERE scope = ?
+                  AND COALESCE(group_id, '') = COALESCE(?, '')
+                  AND user_id = ?
+                  AND todo_no = ?
+                  AND status = ?
+                LIMIT 1
+                """,
+                (scope, group_id, user_id, int(todo_no), STATUS_OPEN),
+            ).fetchone()
+        return _row_to_todo(row) if row is not None else None
 
     def complete(self, todo_id: int) -> TodoReminder | None:
         """把待办标记为已完成。
@@ -545,10 +568,10 @@ class TodoStore:
             conn: 当前 SQLite 连接。
         """
 
+        conn.execute("DROP INDEX IF EXISTS idx_todo_scope_user_no")
+        self._repair_open_todo_numbers(conn)
         conn.executescript(
             """
-            DROP INDEX IF EXISTS idx_todo_scope_user_no;
-
             CREATE UNIQUE INDEX IF NOT EXISTS idx_todo_scope_user_no
             ON todo_reminders(scope, IFNULL(group_id, ''), user_id, todo_no)
             WHERE status = 'open';
@@ -560,6 +583,49 @@ class TodoStore:
             ON todo_reminders(status, reminded_at, remind_at, id);
             """
         )
+
+    def _repair_open_todo_numbers(self, conn: sqlite3.Connection) -> None:
+        """修复旧库中会阻止唯一索引创建的未完成待办序号。
+
+        旧版本数据库可能没有唯一索引，手工导入或历史 bug 也可能留下重复、
+        空值或非正数序号。这里只改 `open` 记录，保留每个正数序号最早出现
+        的记录，其余记录分配当前范围内最小可用正整数。
+
+        Args:
+            conn: 当前 SQLite 连接。
+        """
+
+        rows = conn.execute(
+            """
+            SELECT id, scope, group_id, user_id, todo_no
+            FROM todo_reminders
+            WHERE status = ?
+            ORDER BY scope ASC, COALESCE(group_id, '') ASC, user_id ASC, created_at ASC, id ASC
+            """,
+            (STATUS_OPEN,),
+        ).fetchall()
+        grouped_rows: dict[tuple[str, str, str], list[sqlite3.Row]] = {}
+        for row in rows:
+            key = (str(row["scope"]), _group_key(row["group_id"]), str(row["user_id"]))
+            grouped_rows.setdefault(key, []).append(row)
+
+        for group_rows in grouped_rows.values():
+            used_numbers: set[int] = set()
+            repair_ids: list[int] = []
+            for row in group_rows:
+                todo_no = _positive_todo_no(row["todo_no"])
+                if todo_no is not None and todo_no not in used_numbers:
+                    used_numbers.add(todo_no)
+                else:
+                    repair_ids.append(int(row["id"]))
+
+            for todo_id in repair_ids:
+                todo_no = _first_available_todo_no(used_numbers)
+                used_numbers.add(todo_no)
+                conn.execute(
+                    "UPDATE todo_reminders SET todo_no = ? WHERE id = ?",
+                    (todo_no, todo_id),
+                )
 
     def _used_open_todo_numbers(
         self,
@@ -631,11 +697,16 @@ class TodoStore:
             next_numbers[key] += 1
 
     @contextmanager
-    def _connect(self) -> Iterator[sqlite3.Connection]:
-        """创建 SQLite 连接并在退出时自动提交或回滚。
+    def _connect(self) -> Generator[sqlite3.Connection, None, None]:
+        """创建并托管 SQLite 连接的上下文管理器。
 
-        Yields:
-            已设置 row_factory 的 SQLite 连接。
+        正常退出时提交事务，发生异常时回滚事务，并最终关闭连接。
+
+        Returns:
+            可通过 with self._connect() as conn 使用的 SQLite 连接上下文管理器。
+
+        Raises:
+            Exception: 透传 with 代码块中抛出的异常。
         """
 
         conn = sqlite3.connect(self.db_path)
@@ -652,25 +723,32 @@ class TodoStore:
             conn.close()
 
 
-def resolve_pending_target(
-    pending_items: list[TodoReminder],
-    target: str,
-) -> TodoReminder | None:
-    """把用户输入的待办序号解析为待办记录。
+def parse_pending_target_number(target: str) -> int | None:
+    """解析用户输入的待办序号。
 
     Args:
-        pending_items: 当前展示给用户的未完成待办列表。
         target: 用户输入，支持 `1`、`[3]` 或 `#3`。
 
     Returns:
-        匹配到的待办；没有匹配时返回 None。
+        合法的正整数序号；格式不合法时返回 None。
     """
 
-    normalized = target.strip().strip("[]#")
+    normalized = target.strip()
+    if normalized.startswith("["):
+        if not normalized.endswith("]"):
+            return None
+        normalized = normalized[1:-1].strip()
+    elif normalized.endswith("]"):
+        return None
+    elif normalized.startswith("#"):
+        normalized = normalized[1:].strip()
+    elif "#" in normalized or "[" in normalized:
+        return None
+
     if not normalized.isdigit():
         return None
     number = int(normalized)
-    return next((item for item in pending_items if item.todo_no == number), None)
+    return number if number > 0 else None
 
 
 def _row_to_todo(row: sqlite3.Row) -> TodoReminder:
@@ -706,6 +784,16 @@ def _optional_int(value: Any) -> int | None:
     """把可空数据库字段转换为可空整数。"""
 
     return None if value is None else int(value)
+
+
+def _positive_todo_no(value: Any) -> int | None:
+    """把数据库里的待办序号转换为正整数，非法值返回 None。"""
+
+    try:
+        parsed = _optional_int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed is not None and parsed > 0 else None
 
 
 def _first_available_todo_no(used_numbers: set[int]) -> int:
