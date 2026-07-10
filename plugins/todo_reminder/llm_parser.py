@@ -77,7 +77,7 @@ class TodoLlmParser:
 
         self.config = config
 
-    async def parse(self, user_text: str, reminder_mode: str = "concise") -> list[TodoDraft]:
+    async def _parse(self, user_text: str, reminder_mode: str = "concise") -> list[TodoDraft]:
         """解析用户输入，并返回通过校验的一组待办草稿。
 
         Args:

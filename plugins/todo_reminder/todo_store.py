@@ -210,7 +210,7 @@ class TodoStore:
 
             placeholders = ",".join("?" for _ in todo_ids)
             rows = conn.execute(
-                f"SELECT * FROM todo_reminders WHERE id IN ({placeholders}) ORDER BY id ASC",
+                f"SELECT * FROM todo_reminders WHERE id IN ({placeholders}) ORDER BY id",
                 todo_ids,
             ).fetchall()
         if len(rows) != len(todo_ids):
@@ -246,7 +246,7 @@ class TodoStore:
                   AND COALESCE(group_id, '') = COALESCE(?, '')
                   AND user_id = ?
                   AND status = ?
-                ORDER BY remind_at IS NULL ASC, remind_at ASC, id ASC
+                ORDER BY remind_at IS NULL, remind_at, id
                 LIMIT ?
                 """,
                 (scope, group_id, user_id, STATUS_OPEN, int(limit)),
@@ -334,7 +334,7 @@ class TodoStore:
                   AND reminded_at IS NULL
                   AND remind_at IS NOT NULL
                   AND remind_at <= ?
-                ORDER BY remind_at ASC, id ASC
+                ORDER BY remind_at, id
                 LIMIT ?
                 """,
                 (STATUS_OPEN, int(now), int(limit)),
@@ -486,7 +486,8 @@ class TodoStore:
         self._backfill_todo_no(conn)
         self._ensure_remind_at_nullable(conn)
 
-    def _ensure_remind_at_nullable(self, conn: sqlite3.Connection) -> None:
+    @staticmethod
+    def _ensure_remind_at_nullable(conn: sqlite3.Connection) -> None:
         """把旧表中的 remind_at NOT NULL 迁移为可空字段。
 
         Args:
@@ -584,7 +585,8 @@ class TodoStore:
             """
         )
 
-    def _repair_open_todo_numbers(self, conn: sqlite3.Connection) -> None:
+    @staticmethod
+    def _repair_open_todo_numbers(conn: sqlite3.Connection) -> None:
         """修复旧库中会阻止唯一索引创建的未完成待办序号。
 
         旧版本数据库可能没有唯一索引，手工导入或历史 bug 也可能留下重复、
@@ -600,7 +602,7 @@ class TodoStore:
             SELECT id, scope, group_id, user_id, todo_no
             FROM todo_reminders
             WHERE status = ?
-            ORDER BY scope ASC, COALESCE(group_id, '') ASC, user_id ASC, created_at ASC, id ASC
+            ORDER BY scope, COALESCE(group_id, ''), user_id, created_at, id
             """,
             (STATUS_OPEN,),
         ).fetchall()
@@ -627,8 +629,8 @@ class TodoStore:
                     (todo_no, todo_id),
                 )
 
+    @staticmethod
     def _used_open_todo_numbers(
-        self,
         conn: sqlite3.Connection,
         scope: str,
         group_id: str | None,
@@ -659,7 +661,8 @@ class TodoStore:
         ).fetchall()
         return {int(row["todo_no"]) for row in rows}
 
-    def _backfill_todo_no(self, conn: sqlite3.Connection) -> None:
+    @staticmethod
+    def _backfill_todo_no(conn: sqlite3.Connection) -> None:
         """给旧数据库中缺失 todo_no 的记录补齐范围内序号。
 
         Args:
@@ -671,7 +674,7 @@ class TodoStore:
             SELECT id, scope, group_id, user_id
             FROM todo_reminders
             WHERE todo_no IS NULL
-            ORDER BY scope ASC, COALESCE(group_id, '') ASC, user_id ASC, created_at ASC, id ASC
+            ORDER BY scope, COALESCE(group_id, ''), user_id, created_at, id
             """
         ).fetchall()
         next_numbers: dict[tuple[str, str, str], int] = {}
