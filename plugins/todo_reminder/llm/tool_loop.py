@@ -15,7 +15,9 @@ TODO_TOOL_LOOP_SYSTEM_PROMPT = (
     "你是 Todo 工具选择器。你不能直接声称数据库操作成功，也不能编造数据库结果。"
     "凡是新增、完成、修改、取消、恢复、删除、合并、推迟、提前、延后、改提醒、改时间等写操作，"
     "必须调用一个最合适的工具。工具参数里的 number 只能使用用户当前可见编号，禁止使用或伪造数据库 id。"
-    "提醒展示风格由后端发送提醒时处理，不要把猫娘语气写入标题、内容、时间或工具结果。"
+    "创建待办时，如果运行时 reminder_mode 是 catgirl，必须在 create_todo.reminder_text 中写入猫娘风格提醒文案；"
+    "如果 reminder_mode 是 concise，reminder_text 使用简洁直接的提醒文案或 null。"
+    "不要把猫娘语气写入 title、content、reminder_at、due_at 或工具结果。"
     "如果用户信息不足，请直接用简短中文询问澄清，不要声称已经操作。"
 )
 
@@ -50,7 +52,11 @@ _FAKE_SUCCESS_KEYWORDS = (
 
 @dataclass(frozen=True)
 class TodoToolLoopResponse:
-    """Todo Tool Loop 的最终回复。"""
+    """Todo Tool Loop 的最终回复。
+
+    该对象同时保留用户可见消息、真实工具执行结果和模型普通文本，便于
+    路由层记录上下文编号并在测试中断言模型是否越权声称成功。
+    """
 
     message: str
     tool_results: list[ToolResult]
@@ -66,11 +72,33 @@ class TodoToolLoop:
         store: TodoStore,
         client: Any | None = None,
     ) -> None:
+        """创建 Todo Tool Loop 协调器。
+
+        Args:
+            config: 插件配置，包含 LLM 连接参数。
+            store: Todo 存储层实例。
+            client: 可选 LLM 客户端；测试可注入假客户端。
+        """
+
         self.config = config
         self.store = store
         self.client = client or OpenAICompatibleChatClient(config)
 
     async def run(self, user_text: str, context: TodoToolContext) -> TodoToolLoopResponse:
+        """执行一次 Todo Tool Loop。
+
+        流程是把用户原文、当前可见待办和工具定义交给 LLM，让模型只选择
+        工具；如果模型返回普通文本且声称操作成功，则拦截并明确说明数据库
+        未变更。所有真正的数据库操作都由 TodoToolExecutor 完成。
+
+        Args:
+            user_text: 用户输入的 Todo 操作文案。
+            context: 程序路由层生成的可信工具上下文。
+
+        Returns:
+            基于真实工具结果生成的最终回复。
+        """
+
         executor = TodoToolExecutor(self.store, context)
         choice = await self.client.complete_with_tools(
             self._build_messages(user_text, context),
@@ -117,6 +145,16 @@ class TodoToolLoop:
         user_text: str,
         context: TodoToolContext,
     ) -> list[dict[str, str]]:
+        """构建发送给 LLM 的消息。
+
+        Args:
+            user_text: 用户输入的 Todo 操作文案。
+            context: 程序路由层生成的可信工具上下文。
+
+        Returns:
+            包含系统约束、运行时上下文、当前可见待办和用户原文的消息列表。
+        """
+
         pending = self.store.list_by_status(
             context.scope,
             context.group_id,
@@ -136,6 +174,7 @@ class TodoToolLoop:
             "运行时上下文：\n"
             f"current_time: {now:%Y-%m-%d %H:%M:%S}\n"
             f"timezone: {context.timezone.key if hasattr(context.timezone, 'key') else context.timezone}\n"
+            f"reminder_mode: {context.reminder_mode}\n"
             f"last_todo_no: {context.last_todo_no}\n\n"
             "用户当前可见未完成待办：\n"
             f"{_format_visible_todos(pending)}\n\n"
@@ -151,13 +190,29 @@ class TodoToolLoop:
 
 
 def contains_fake_success_claim(content: str) -> bool:
-    """判断模型普通文本是否在未调用工具时声称操作成功。"""
+    """判断模型普通文本是否在未调用工具时声称操作成功。
+
+    Args:
+        content: 模型未调用工具时返回的普通文本。
+
+    Returns:
+        文本包含“已完成/已删除/已新增”等成功语义时返回 True。
+    """
 
     normalized = content.strip()
     return bool(normalized) and any(keyword in normalized for keyword in _FAKE_SUCCESS_KEYWORDS)
 
 
 def _format_visible_todos(items: list[TodoReminder]) -> str:
+    """格式化当前可见待办，作为 LLM 选择工具的上下文。
+
+    Args:
+        items: 当前用户当前范围内可见的待办列表。
+
+    Returns:
+        面向模型的紧凑文本；没有待办时返回 `无`。
+    """
+
     if not items:
         return "无"
     rows = []
@@ -171,4 +226,13 @@ def _format_visible_todos(items: list[TodoReminder]) -> str:
 
 
 def _format_timestamp(value: int | None) -> str:
+    """格式化传给模型的时间戳。
+
+    Args:
+        value: Unix 秒级时间戳或 None。
+
+    Returns:
+        原始时间戳文本；未设置时返回 `未设置`。
+    """
+
     return "未设置" if value is None else str(value)

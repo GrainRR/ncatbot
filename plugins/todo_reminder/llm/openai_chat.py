@@ -13,7 +13,11 @@ from typing import Any
 
 @dataclass(frozen=True)
 class ChatToolCall:
-    """模型返回的单个工具调用。"""
+    """模型返回的单个工具调用。
+
+    这里只保存工具名、已解析为字典的参数和可选调用 ID，后续执行仍会由
+    后端工具层做白名单与 schema 校验。
+    """
 
     name: str
     arguments: dict[str, Any]
@@ -22,7 +26,11 @@ class ChatToolCall:
 
 @dataclass(frozen=True)
 class ChatCompletionChoice:
-    """模型返回的首选消息。"""
+    """模型返回的首选消息。
+
+    包含普通文本和工具调用列表。Tool Loop 会根据工具调用是否存在决定
+    是否允许进入后端执行。
+    """
 
     content: str
     tool_calls: list[ChatToolCall]
@@ -36,6 +44,12 @@ class OpenAICompatibleChatClient:
     """调用 OpenAI 兼容的 chat/completions 接口。"""
 
     def __init__(self, config: dict[str, Any]) -> None:
+        """创建 LLM 客户端。
+
+        Args:
+            config: 插件配置，包含接口地址、密钥、模型名和超时时间。
+        """
+
         self.config = config
 
     async def complete_with_tools(
@@ -43,6 +57,19 @@ class OpenAICompatibleChatClient:
         messages: list[dict[str, str]],
         tools: list[dict[str, Any]],
     ) -> ChatCompletionChoice:
+        """异步调用带工具定义的 chat/completions。
+
+        Args:
+            messages: 发送给模型的消息列表。
+            tools: OpenAI compatible tools 定义。
+
+        Returns:
+            模型首选回复，包含普通文本和工具调用列表。
+
+        Raises:
+            LlmRequestError: 请求失败、超时或响应格式非法。
+        """
+
         return await asyncio.to_thread(self._complete_with_tools, messages, tools)
 
     def _complete_with_tools(
@@ -50,6 +77,19 @@ class OpenAICompatibleChatClient:
         messages: list[dict[str, str]],
         tools: list[dict[str, Any]],
     ) -> ChatCompletionChoice:
+        """在线程中执行同步 HTTP 请求。
+
+        Args:
+            messages: 发送给模型的消息列表。
+            tools: OpenAI compatible tools 定义。
+
+        Returns:
+            解析后的模型首选回复。
+
+        Raises:
+            LlmRequestError: LLM 未配置、HTTP 请求失败、超时或响应不是有效 JSON。
+        """
+
         api_url = self._api_url()
         api_key = self._api_key()
         model = str(self.config.get("llm_model") or "").strip()
@@ -95,6 +135,13 @@ class OpenAICompatibleChatClient:
         return _extract_choice(data)
 
     def _api_url(self) -> str:
+        """解析 LLM 接口地址。
+
+        Returns:
+            显式配置的 `llm_api_url`，或由 `llm_api_base` 拼出的
+            `/chat/completions` 地址；未配置时返回空字符串。
+        """
+
         explicit = str(self.config.get("llm_api_url") or "").strip()
         if explicit:
             return explicit
@@ -104,6 +151,13 @@ class OpenAICompatibleChatClient:
         return f"{base}/chat/completions"
 
     def _api_key(self) -> str:
+        """解析 LLM API key。
+
+        Returns:
+            优先返回配置中的 `llm_api_key`；否则按 `llm_api_key_env`
+            指定的环境变量读取。
+        """
+
         key = str(self.config.get("llm_api_key") or "").strip()
         if key:
             return key
@@ -112,6 +166,18 @@ class OpenAICompatibleChatClient:
 
 
 def _extract_choice(data: dict[str, Any]) -> ChatCompletionChoice:
+    """从 OpenAI compatible 响应中抽取首选消息。
+
+    Args:
+        data: 已解析的 JSON 响应。
+
+    Returns:
+        标准化后的首选消息。
+
+    Raises:
+        LlmRequestError: 响应缺少 choices 或 message 格式不合法。
+    """
+
     choices = data.get("choices")
     if not isinstance(choices, list) or not choices:
         raise LlmRequestError("LLM 响应里没有 choices")
@@ -129,6 +195,15 @@ def _extract_choice(data: dict[str, Any]) -> ChatCompletionChoice:
 
 
 def _extract_content(content: Any) -> str:
+    """抽取模型普通文本。
+
+    Args:
+        content: message.content 字段，兼容字符串和分段数组格式。
+
+    Returns:
+        拼接后的普通文本；没有文本时返回空字符串。
+    """
+
     if isinstance(content, str):
         return content
     if isinstance(content, list):
@@ -138,6 +213,20 @@ def _extract_content(content: Any) -> str:
 
 
 def _extract_tool_calls(message: dict[str, Any]) -> list[ChatToolCall]:
+    """抽取模型工具调用。
+
+    同时兼容新式 `tool_calls` 和旧式 `function_call` 响应格式。
+
+    Args:
+        message: 响应中的 message 对象。
+
+    Returns:
+        标准化后的工具调用列表。
+
+    Raises:
+        LlmRequestError: 工具参数不是 JSON 对象或不是有效 JSON。
+    """
+
     raw_tool_calls = message.get("tool_calls")
     if isinstance(raw_tool_calls, list) and raw_tool_calls:
         calls: list[ChatToolCall] = []
@@ -174,6 +263,18 @@ def _extract_tool_calls(message: dict[str, Any]) -> list[ChatToolCall]:
 
 
 def _parse_arguments(value: Any) -> dict[str, Any]:
+    """解析工具调用参数。
+
+    Args:
+        value: 模型返回的 function.arguments，可以是字典或 JSON 字符串。
+
+    Returns:
+        JSON 对象形式的工具参数。
+
+    Raises:
+        LlmRequestError: 参数不是 JSON 对象或 JSON 解析失败。
+    """
+
     if isinstance(value, dict):
         return value
     if not isinstance(value, str):
@@ -188,6 +289,16 @@ def _parse_arguments(value: Any) -> dict[str, Any]:
 
 
 def _positive_int(value: Any, default: int) -> int:
+    """把配置值转换为正整数。
+
+    Args:
+        value: 待转换的配置值。
+        default: 转换失败或不是正整数时使用的默认值。
+
+    Returns:
+        正整数配置值。
+    """
+
     try:
         parsed = int(value)
     except (TypeError, ValueError):

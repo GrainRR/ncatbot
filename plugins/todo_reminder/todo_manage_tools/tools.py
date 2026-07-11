@@ -1,4 +1,4 @@
-"""后端托管的 Todo 管理工具。
+"""后端托管的 todo 管理工具。
 
 LLM 只能选择这里白名单中的工具和参数；所有数据库读取、状态校验、
 权限校验和持久化都在本模块完成。
@@ -48,7 +48,11 @@ _REFERENCE_WORDS = {
 
 @dataclass(frozen=True)
 class TodoToolContext:
-    """一次 Todo 工具执行所需的可信运行时上下文。"""
+    """一次 Todo 工具执行所需的可信运行时上下文。
+
+    这些字段由程序路由层生成，不能由 LLM 自行指定。工具执行时只信任
+    这里的范围、用户、时间和提醒风格配置。
+    """
 
     scope: str
     group_id: str | None
@@ -72,6 +76,12 @@ class ToolResult:
     data: dict[str, Any]
 
     def to_dict(self) -> dict[str, Any]:
+        """转换为可序列化的字典。
+
+        Returns:
+            包含执行状态、用户可见消息和结构化数据的字典。
+        """
+
         return {
             "ok": self.ok,
             "status": self.status,
@@ -82,12 +92,24 @@ class ToolResult:
 
 @dataclass(frozen=True)
 class ToolSpec:
+    """后端工具定义。
+
+    包含暴露给 LLM 的工具描述、JSON schema，以及最终由后端调用的
+    执行函数。
+    """
+
     name: str
     description: str
     parameters: dict[str, Any]
     handler: Callable[[dict[str, Any]], ToolResult]
 
     def to_openai_tool(self) -> dict[str, Any]:
+        """转换为 OpenAI compatible tools 参数格式。
+
+        Returns:
+            可直接传给 chat/completions `tools` 字段的工具定义。
+        """
+
         return {
             "type": "function",
             "function": {
@@ -106,6 +128,12 @@ class ToolExecutionStop(Exception):
     """工具执行遇到错误、确认或澄清时短路。"""
 
     def __init__(self, result: ToolResult) -> None:
+        """保存需要直接返回给 Tool Loop 的工具结果。
+
+        Args:
+            result: 已经结构化的错误、确认或澄清结果。
+        """
+
         super().__init__(result.message)
         self.result = result
 
@@ -114,16 +142,38 @@ class TodoToolExecutor:
     """执行 Todo 管理工具，并保证所有写库操作经过后端校验。"""
 
     def __init__(self, store: TodoStore, context: TodoToolContext) -> None:
+        """创建工具执行器。
+
+        Args:
+            store: Todo 存储层实例。
+            context: 程序路由层生成的可信执行上下文。
+        """
+
         self.store = store
         self.context = context
         self._specs = _build_tool_specs(self)
 
     @property
     def tool_definitions(self) -> list[dict[str, Any]]:
+        """返回传给 LLM 的工具定义列表。
+
+        Returns:
+            OpenAI compatible tools 列表，只包含白名单工具。
+        """
+
         return [spec.to_openai_tool() for spec in self._specs.values()]
 
     def execute(self, tool_name: str, arguments: dict[str, Any]) -> ToolResult:
-        """校验并执行一个工具调用。"""
+        """校验并执行一个工具调用。
+
+        Args:
+            tool_name: LLM 选择的工具名。
+            arguments: LLM 生成的工具参数。
+
+        Returns:
+            工具执行结果。未知工具、schema 错误和业务校验失败都会返回
+            `ok=False` 的结构化结果，不会直接抛给用户。
+        """
 
         spec = self._specs.get(tool_name)
         if spec is None:
@@ -155,6 +205,15 @@ class TodoToolExecutor:
             return exc.result
 
     def list_todos(self, args: dict[str, Any]) -> ToolResult:
+        """列出当前可信上下文范围内的待办。
+
+        Args:
+            args: 已通过 schema 校验的工具参数，支持 `status` 和 `limit`。
+
+        Returns:
+            当前用户当前范围内的待办列表结果。
+        """
+
         status = args.get("status") or STATUS_OPEN
         limit = args.get("limit") or 20
         store_status = None if status == "all" else status
@@ -179,6 +238,15 @@ class TodoToolExecutor:
         )
 
     def get_todo(self, args: dict[str, Any]) -> ToolResult:
+        """按用户可见编号查看待办详情。
+
+        Args:
+            args: 已通过 schema 校验的工具参数，包含 `number` 或 `reference`。
+
+        Returns:
+            匹配待办的详情结果。
+        """
+
         number = self._number_from_args(args)
         item = self._resolve_todo(number, None, "查看")
         return ToolResult(
@@ -189,12 +257,31 @@ class TodoToolExecutor:
         )
 
     def create_todo(self, args: dict[str, Any]) -> ToolResult:
+        """创建一条待办。
+
+        Args:
+            args: 已通过 schema 校验的工具参数，包含标题、内容、时间和
+                可选提醒文案。
+
+        Returns:
+            创建成功时返回新待办；参数或业务规则不满足时返回错误结果。
+        """
+
         title = _clean_required_text(args.get("title"), "title")
         content = _clean_optional_text(args.get("content"))
         raw_text = _clean_optional_text(args.get("raw_text")) or self.context.user_text or title
         reminder_at = self._parse_optional_time(args.get("reminder_at"), "reminder_at")
         due_at = self._parse_optional_time(args.get("due_at"), "due_at")
-        reminder_text = _clean_optional_text(args.get("reminder_text")) or ""
+        reminder_text = _clean_optional_text(args.get("reminder_text"))
+        if self.context.reminder_mode == "catgirl" and not reminder_text:
+            return ToolResult(
+                ok=False,
+                status="error",
+                message="猫娘模式创建待办需要生成提醒文案，待办没有写入",
+                data={},
+            )
+        if not reminder_text:
+            reminder_text = _fallback_reminder_text(title)
 
         if self.context.reject_past_reminder and reminder_at is not None:
             if reminder_at <= self.context.now:
@@ -242,6 +329,16 @@ class TodoToolExecutor:
         )
 
     def edit_todo(self, args: dict[str, Any]) -> ToolResult:
+        """修改一条未完成待办的可编辑字段。
+
+        Args:
+            args: 已通过 schema 校验的工具参数，包含目标编号和要更新的
+                标题、内容、时间或提醒文案。
+
+        Returns:
+            修改后的待办；没有可更新字段时返回澄清结果。
+        """
+
         number = self._number_from_args(args)
         item = self._resolve_todo(number, (STATUS_OPEN,), "修改")
         updates: dict[str, Any] = {}
@@ -280,6 +377,16 @@ class TodoToolExecutor:
         )
 
     def shift_todo_time(self, args: dict[str, Any]) -> ToolResult:
+        """按分钟提前或推迟待办时间。
+
+        Args:
+            args: 已通过 schema 校验的工具参数，包含目标编号、时间字段、
+                调整方向和正整数分钟数。
+
+        Returns:
+            更新后的待办；字段不明确或目标没有时间字段时返回澄清结果。
+        """
+
         number = self._number_from_args(args)
         item = self._resolve_todo(number, (STATUS_OPEN,), "调整时间")
         field = args["field"]
@@ -327,6 +434,16 @@ class TodoToolExecutor:
         )
 
     def complete_todos(self, args: dict[str, Any]) -> ToolResult:
+        """完成一个或多个未完成待办。
+
+        Args:
+            args: 已通过 schema 校验的工具参数，包含 `numbers`、`number`
+                或 `reference`。
+
+        Returns:
+            已完成待办列表；目标不存在或状态非法时返回错误结果。
+        """
+
         numbers = self._numbers_from_args(args)
         items = [self._resolve_todo(number, (STATUS_OPEN,), "完成") for number in numbers]
         completed: list[TodoReminder] = []
@@ -343,6 +460,15 @@ class TodoToolExecutor:
         )
 
     def cancel_todo(self, args: dict[str, Any]) -> ToolResult:
+        """取消一条未完成待办。
+
+        Args:
+            args: 已通过 schema 校验的工具参数，包含 `number` 或 `reference`。
+
+        Returns:
+            已软删除的待办；目标不存在或状态非法时返回错误结果。
+        """
+
         number = self._number_from_args(args)
         item = self._resolve_todo(number, (STATUS_OPEN,), "取消")
         canceled = self.store.cancel(item.id)
@@ -356,6 +482,16 @@ class TodoToolExecutor:
         )
 
     def restore_todos(self, args: dict[str, Any]) -> ToolResult:
+        """恢复一个或多个已完成或已取消待办。
+
+        Args:
+            args: 已通过 schema 校验的工具参数，包含 `numbers`、`number`
+                或 `reference`。
+
+        Returns:
+            已恢复待办列表；目标不存在或状态非法时返回错误结果。
+        """
+
         numbers = self._numbers_from_args(args)
         items = [
             self._resolve_todo(number, (STATUS_DONE, STATUS_DELETED), "恢复")
@@ -375,6 +511,15 @@ class TodoToolExecutor:
         )
 
     def delete_todos(self, args: dict[str, Any]) -> ToolResult:
+        """永久删除一个或多个待办。
+
+        Args:
+            args: 已通过 schema 校验的工具参数，包含目标编号和 `confirmed`。
+
+        Returns:
+            未确认时返回确认结果且不删库；确认后返回永久删除结果。
+        """
+
         numbers = self._numbers_from_args(args)
         items = [self._resolve_todo(number, None, "永久删除") for number in numbers]
         if args.get("confirmed") is not True:
@@ -397,6 +542,16 @@ class TodoToolExecutor:
         )
 
     def merge_todos(self, args: dict[str, Any]) -> ToolResult:
+        """合并多条未完成待办。
+
+        Args:
+            args: 已通过 schema 校验的工具参数，包含至少两个用户可见编号
+                和可选合并后标题。
+
+        Returns:
+            合并后的待办；编号不足或状态非法时返回澄清或错误结果。
+        """
+
         numbers = self._numbers_from_args(args)
         if len(numbers) < 2:
             return ToolResult(
@@ -434,6 +589,15 @@ class TodoToolExecutor:
         )
 
     def _numbers_from_args(self, args: dict[str, Any]) -> list[int]:
+        """从工具参数中解析一个或多个用户可见编号。
+
+        Args:
+            args: 已通过 schema 校验的工具参数。
+
+        Returns:
+            去重后的正整数编号列表。
+        """
+
         numbers = args.get("numbers")
         if numbers:
             unique_numbers = list(dict.fromkeys(int(number) for number in numbers))
@@ -442,6 +606,21 @@ class TodoToolExecutor:
         return [self._number_from_args(args)]
 
     def _number_from_args(self, args: dict[str, Any]) -> int:
+        """从工具参数中解析单个用户可见编号。
+
+        支持显式 `number`、数字字符串 `reference`，以及“刚才那个”等
+        由程序上下文记录的引用词。
+
+        Args:
+            args: 已通过 schema 校验的工具参数。
+
+        Returns:
+            用户当前可见待办编号。
+
+        Raises:
+            ToolExecutionStop: 缺少可解析编号时抛出澄清结果。
+        """
+
         number = args.get("number")
         if number is not None:
             return int(number)
@@ -465,6 +644,20 @@ class TodoToolExecutor:
         statuses: tuple[str, ...] | None,
         action: str,
     ) -> TodoReminder:
+        """在可信上下文范围内解析待办并校验状态。
+
+        Args:
+            number: 用户当前可见编号。
+            statuses: 允许的待办状态；传入 None 时允许所有状态。
+            action: 当前业务动作名称，用于生成错误提示。
+
+        Returns:
+            匹配到且状态合法的待办。
+
+        Raises:
+            ToolExecutionStop: 目标不存在或当前状态不允许执行该动作。
+        """
+
         item = self.store.find_by_no(
             self.context.scope,
             self.context.group_id,
@@ -501,6 +694,16 @@ class TodoToolExecutor:
         )
 
     def _status_changed_result(self, number: int, action: str) -> ToolResult:
+        """生成并发状态变化后的失败结果。
+
+        Args:
+            number: 用户当前可见编号。
+            action: 当前业务动作名称，用于生成错误提示。
+
+        Returns:
+            描述目标不存在或状态已经变化的结构化结果。
+        """
+
         existing = self.store.find_by_no(
             self.context.scope,
             self.context.group_id,
@@ -523,6 +726,20 @@ class TodoToolExecutor:
         )
 
     def _shift_fields(self, item: TodoReminder, field: str) -> list[str]:
+        """解析需要调整的时间字段。
+
+        Args:
+            item: 待调整的未完成待办。
+            field: LLM 传入的字段选择，取值为 `auto`、`due_at`、
+                `reminder_at` 或 `both`。
+
+        Returns:
+            需要更新的工具层字段名列表。
+
+        Raises:
+            ToolExecutionStop: 目标没有对应时间字段，或 `auto` 无法消歧。
+        """
+
         if field == "both":
             if item.remind_at is None and item.due_at is None:
                 raise ToolExecutionStop(
@@ -580,6 +797,19 @@ class TodoToolExecutor:
         return ["reminder_at"] if has_reminder else ["due_at"]
 
     def _parse_optional_time(self, value: Any, field_name: str) -> int | None:
+        """解析可选时间参数并应用提醒时间业务校验。
+
+        Args:
+            value: LLM 传入的时间文本或空值。
+            field_name: 当前解析的工具字段名。
+
+        Returns:
+            Unix 秒级时间戳；空值返回 None。
+
+        Raises:
+            ToolExecutionStop: 时间格式非法，或提醒时间早于当前时间。
+        """
+
         text = _clean_optional_text(value)
         if text is None:
             return None
@@ -597,6 +827,15 @@ class TodoToolExecutor:
         return int(parsed.timestamp())
 
     def _todo_to_dict(self, item: TodoReminder) -> dict[str, Any]:
+        """把待办记录转换为工具结果中的结构化数据。
+
+        Args:
+            item: 待办记录。
+
+        Returns:
+            只暴露用户可见编号和业务字段的字典，不包含数据库内部 ID。
+        """
+
         return {
             "number": item.todo_no,
             "title": item.title,
@@ -609,6 +848,16 @@ class TodoToolExecutor:
         }
 
     def _format_list(self, title: str, items: list[TodoReminder]) -> str:
+        """格式化待办列表回复。
+
+        Args:
+            title: 列表标题。
+            items: 待展示的待办列表。
+
+        Returns:
+            可直接发送给用户的列表文本。
+        """
+
         if not items:
             return f"当前没有{title}。"
         rows = [f"{title}："]
@@ -622,6 +871,15 @@ class TodoToolExecutor:
         return "\n".join(rows)
 
     def _format_detail(self, item: TodoReminder) -> str:
+        """格式化单条待办详情。
+
+        Args:
+            item: 待办记录。
+
+        Returns:
+            可直接发送给用户的详情文本。
+        """
+
         return (
             f"{self._format_inline(item)}\n"
             f"状态：{_status_label(item.status)}\n"
@@ -630,16 +888,38 @@ class TodoToolExecutor:
         )
 
     def _format_inline(self, item: TodoReminder) -> str:
+        """格式化待办的单行标题。
+
+        Args:
+            item: 待办记录。
+
+        Returns:
+            形如 `[1] 标题` 的展示文本。
+        """
+
         return f"[{item.todo_no}] {_truncate(item.title, 80)}"
 
     def _format_time(self, timestamp: int | None) -> str:
+        """按工具上下文时区格式化时间戳。
+
+        Args:
+            timestamp: Unix 秒级时间戳；未设置时传入 None。
+
+        Returns:
+            本地时间文本，或 `未设置`。
+        """
+
         if timestamp is None:
             return "未设置"
         return datetime.fromtimestamp(timestamp, self.context.timezone).strftime("%Y-%m-%d %H:%M")
 
 
 def openai_tool_definitions() -> list[dict[str, Any]]:
-    """返回 OpenAI compatible chat/completions 的工具定义。"""
+    """返回 OpenAI compatible chat/completions 的工具定义。
+
+    Returns:
+        Todo 工具白名单对应的 OpenAI tools 列表。
+    """
 
     executor = TodoToolExecutor.__new__(TodoToolExecutor)
     specs = _build_tool_specs(executor)
@@ -647,6 +927,15 @@ def openai_tool_definitions() -> list[dict[str, Any]]:
 
 
 def _build_tool_specs(executor: TodoToolExecutor) -> dict[str, ToolSpec]:
+    """构建 Todo 工具白名单。
+
+    Args:
+        executor: 当前工具执行器实例。
+
+    Returns:
+        以工具名为键的工具定义映射。
+    """
+
     return {
         "list_todos": ToolSpec(
             "list_todos",
@@ -764,6 +1053,15 @@ def _build_tool_specs(executor: TodoToolExecutor) -> dict[str, ToolSpec]:
 
 
 def _target_schema(required: list[str]) -> dict[str, Any]:
+    """构建单目标工具的 JSON schema。
+
+    Args:
+        required: 必填字段名列表。
+
+    Returns:
+        允许 `number` 或 `reference` 的对象 schema。
+    """
+
     return _object_schema(
         {
             "number": {"type": ["integer", "null"], "minimum": 1},
@@ -774,6 +1072,15 @@ def _target_schema(required: list[str]) -> dict[str, Any]:
 
 
 def _numbers_schema(required: list[str]) -> dict[str, Any]:
+    """构建多目标工具的 JSON schema。
+
+    Args:
+        required: 必填字段名列表。
+
+    Returns:
+        允许 `numbers`、`number` 或 `reference` 的对象 schema。
+    """
+
     return _object_schema(
         {
             "numbers": {"type": "array", "items": {"type": "integer", "minimum": 1}, "minItems": 1},
@@ -785,6 +1092,16 @@ def _numbers_schema(required: list[str]) -> dict[str, Any]:
 
 
 def _object_schema(properties: dict[str, Any], required: list[str]) -> dict[str, Any]:
+    """构建禁止额外字段的对象 schema。
+
+    Args:
+        properties: JSON schema properties 定义。
+        required: 必填字段名列表。
+
+    Returns:
+        `additionalProperties=False` 的对象 schema。
+    """
+
     return {
         "type": "object",
         "properties": properties,
@@ -794,6 +1111,17 @@ def _object_schema(properties: dict[str, Any], required: list[str]) -> dict[str,
 
 
 def validate_json_schema(value: Any, schema: dict[str, Any], path: str = "$") -> None:
+    """按项目内最小 JSON schema 子集校验工具参数。
+
+    Args:
+        value: 待校验的参数值。
+        schema: 工具参数 schema。
+        path: 当前校验路径，用于生成错误提示。
+
+    Raises:
+        ToolValidationError: 参数类型、枚举、必填字段、额外字段或范围不满足 schema。
+    """
+
     expected_type = schema.get("type")
     if expected_type is not None:
         expected_types = expected_type if isinstance(expected_type, list) else [expected_type]
@@ -838,6 +1166,16 @@ def validate_json_schema(value: Any, schema: dict[str, Any], path: str = "$") ->
 
 
 def _matches_json_type(value: Any, expected_type: str) -> bool:
+    """判断值是否匹配 JSON schema 类型。
+
+    Args:
+        value: 待检查的值。
+        expected_type: JSON schema 类型名。
+
+    Returns:
+        类型匹配时返回 True，否则返回 False。
+    """
+
     if expected_type == "object":
         return isinstance(value, dict)
     if expected_type == "array":
@@ -854,6 +1192,20 @@ def _matches_json_type(value: Any, expected_type: str) -> bool:
 
 
 def _parse_local_datetime(value: str, timezone: ZoneInfo) -> datetime:
+    """解析 LLM 传入的本地时间或带时区时间。
+
+    Args:
+        value: 时间文本，支持 `YYYY-MM-DD HH:MM`、
+            `YYYY-MM-DD HH:MM:SS` 和 ISO 带时区格式。
+        timezone: 未显式带时区时使用的本地时区。
+
+    Returns:
+        带时区信息的 datetime。
+
+    Raises:
+        ToolExecutionStop: 时间文本无法解析时抛出结构化错误。
+    """
+
     normalized = value.strip().replace("T", " ")
     if normalized.endswith("Z") or "+" in normalized[10:] or "-" in normalized[10:]:
         try:
@@ -885,6 +1237,19 @@ def _parse_local_datetime(value: str, timezone: ZoneInfo) -> datetime:
 
 
 def _clean_required_text(value: Any, field_name: str) -> str:
+    """清洗必填文本字段。
+
+    Args:
+        value: LLM 传入的字段值。
+        field_name: 字段名，用于生成错误提示。
+
+    Returns:
+        去掉首尾空白后的文本。
+
+    Raises:
+        ToolExecutionStop: 字段为空或等价于空值。
+    """
+
     text = _clean_optional_text(value)
     if not text:
         raise ToolExecutionStop(
@@ -899,6 +1264,16 @@ def _clean_required_text(value: Any, field_name: str) -> str:
 
 
 def _clean_optional_text(value: Any) -> str | None:
+    """清洗可选文本字段。
+
+    Args:
+        value: LLM 传入的字段值。
+
+    Returns:
+        去掉首尾空白后的文本；空值、`null`、`none`、`无` 或 `未设置`
+        返回 None。
+    """
+
     if value is None:
         return None
     text = str(value).strip()
@@ -907,11 +1282,29 @@ def _clean_optional_text(value: Any) -> str | None:
     return text
 
 
-def _fallback_reminder_text(title: str, reminder_mode: str) -> str:
+def _fallback_reminder_text(title: str) -> str:
+    """生成简洁模式的默认提醒文案。
+
+    Args:
+        title: 待办标题。
+
+    Returns:
+        可用于到点提醒的简洁文案。
+    """
+
     return f"该做：{title}"
 
 
 def _status_label(status: str) -> str:
+    """把内部状态值转换为用户可读文案。
+
+    Args:
+        status: 内部状态值。
+
+    Returns:
+        用户可读的中文状态名。
+    """
+
     return {
         STATUS_OPEN: "未完成",
         STATUS_DONE: "已完成",
@@ -920,9 +1313,28 @@ def _status_label(status: str) -> str:
 
 
 def _time_field_label(field_name: str) -> str:
+    """把工具层时间字段名转换为用户可读文案。
+
+    Args:
+        field_name: 工具层时间字段名。
+
+    Returns:
+        `提醒时间` 或 `截止时间`。
+    """
+
     return "提醒时间" if field_name == "reminder_at" else "截止时间"
 
 
 def _truncate(text: str, limit: int) -> str:
+    """按字符数截断文本。
+
+    Args:
+        text: 原始文本。
+        limit: 最大字符数。
+
+    Returns:
+        不超过指定长度的文本。
+    """
+
     text = text.strip()
     return text if len(text) <= limit else text[: limit - 1] + "..."

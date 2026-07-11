@@ -13,15 +13,6 @@ from ncatbot.plugin import NcatBotPlugin
 from ncatbot.types import MessageArray
 
 from .llm import TodoToolLoop
-from .llm_parser import (
-    TODO_PREPROCESS_CLARIFY,
-    TODO_PREPROCESS_COMPLETED,
-    TODO_PREPROCESS_PENDING,
-    TODO_PREPROCESS_TOOL_LOOP,
-    preprocess_hash_todo_content,
-    preprocess_todo_command,
-    render_reminder_text,
-)
 from .todo_manage_tools import TodoToolContext
 from .todo_store import (
     MODE_CATGIRL,
@@ -57,6 +48,20 @@ _COMPLETED_QUERY_TEXTS = {
     "查看已完成待办",
     "已完成待办",
 }
+_MODE_CATGIRL_TEXTS = {
+    "猫娘模式",
+    "待办猫娘模式",
+    "提醒猫娘模式",
+    "切换猫娘模式",
+    "设置猫娘模式",
+}
+_MODE_CONCISE_TEXTS = {
+    "简洁模式",
+    "待办简洁模式",
+    "提醒简洁模式",
+    "切换简洁模式",
+    "设置简洁模式",
+}
 _TODO_WRITE_KEYWORDS = (
     "新增",
     "添加",
@@ -67,6 +72,8 @@ _TODO_WRITE_KEYWORDS = (
     "完成",
     "修改",
     "更改",
+    "改成",
+    "改为",
     "取消",
     "恢复",
     "删除",
@@ -80,6 +87,8 @@ _TODO_WRITE_KEYWORDS = (
     "改提醒",
     "改时间",
     "提醒调整",
+    "提醒",
+    "提醒我",
 )
 _TODO_REFERENCE_WORDS = (
     "第",
@@ -96,6 +105,14 @@ _TODO_REFERENCE_WORDS = (
     "小时",
 )
 _CHINESE_NUMBER_CHARS = set("一二三四五六七八九十两")
+_TODO_CREATE_PREFIXES = (
+    "新增",
+    "添加",
+    "创建",
+    "新建",
+    "加个",
+    "加一条",
+)
 
 
 class TodoReminderPlugin(NcatBotPlugin):
@@ -123,7 +140,7 @@ class TodoReminderPlugin(NcatBotPlugin):
                 "llm_model": "",
                 "llm_timeout_seconds": 30,
                 "timezone": "Asia/Shanghai",
-                "default_reminder_mode": MODE_CATGIRL,
+                "default_reminder_mode": MODE_CONCISE,
                 "reminder_check_interval": "60s",
                 "max_pending_todos_per_scope": 100,
                 "max_due_reminders_per_check": 20,
@@ -141,141 +158,25 @@ class TodoReminderPlugin(NcatBotPlugin):
         )
         self.logger.info("待办提醒数据库已就绪: %s", self.store.db_path)
 
-    async def add_group_todo(self, event: GroupMessageEvent, content: str = ""):
-        """在群聊中创建个人待办提醒。
-
-        Args:
-            event: 触发命令的群消息事件。
-            content: 用户在 `#待办` 后输入的自然语言内容。
-        """
-
-        await self._add_todo(event, *self._group_context(event), content)
-
-    async def add_private_todo(self, event: PrivateMessageEvent, content: str = ""):
-        """在私聊中创建待办提醒。
-
-        Args:
-            event: 触发命令的私聊消息事件。
-            content: 用户在 `#待办` 后输入的自然语言内容。
-        """
-
-        await self._add_todo(event, *self._private_context(event), content)
-
     @registrar.qq.on_group_message()
     async def route_group_todo_message(self, event: GroupMessageEvent):
-        """把普通群消息中的 Todo 查询和写操作路由到确定性路径或 Tool Loop。"""
+        """把普通群消息中的 Todo 查询和写操作路由到确定性路径或 Tool Loop。
+
+        Args:
+            event: 收到的群消息事件。
+        """
 
         await self._route_todo_message(event, *self._group_context(event))
 
     @registrar.qq.on_private_message()
     async def route_private_todo_message(self, event: PrivateMessageEvent):
-        """把普通私聊消息中的 Todo 查询和写操作路由到确定性路径或 Tool Loop。"""
+        """把普通私聊消息中的 Todo 查询和写操作路由到确定性路径或 Tool Loop。
+
+        Args:
+            event: 收到的私聊消息事件。
+        """
 
         await self._route_todo_message(event, *self._private_context(event))
-
-    @registrar.qq.on_group_command("#待办列表")
-    async def list_group_todos(self, event: GroupMessageEvent):
-        """查看当前用户在当前群内创建的未完成待办。
-
-        Args:
-            event: 触发命令的群消息事件。
-        """
-
-        await self._list_todos(event, *self._group_context(event))
-
-    @registrar.qq.on_private_command("#待办列表")
-    async def list_private_todos(self, event: PrivateMessageEvent):
-        """查看当前用户在私聊中创建的未完成待办。
-
-        Args:
-            event: 触发命令的私聊消息事件。
-        """
-
-        await self._list_todos(event, *self._private_context(event))
-
-    @registrar.qq.on_group_command("#待办-猫娘模式")
-    async def set_group_catgirl_mode(self, event: GroupMessageEvent):
-        """把当前用户在当前群内的提醒模式切换为猫娘模式。
-
-        Args:
-            event: 触发命令的群消息事件。
-        """
-
-        await self._switch_mode(event, *self._group_context(event), MODE_CATGIRL)
-
-    @registrar.qq.on_private_command("#待办-猫娘模式")
-    async def set_private_catgirl_mode(self, event: PrivateMessageEvent):
-        """把当前用户在私聊中的提醒模式切换为猫娘模式。
-
-        Args:
-            event: 触发命令的私聊消息事件。
-        """
-
-        await self._switch_mode(event, *self._private_context(event), MODE_CATGIRL)
-
-    @registrar.qq.on_group_command("#待办-简洁模式")
-    async def set_group_concise_mode(self, event: GroupMessageEvent):
-        """把当前用户在当前群内的提醒模式切换为简洁模式。
-
-        Args:
-            event: 触发命令的群消息事件。
-        """
-
-        await self._switch_mode(event, *self._group_context(event), MODE_CONCISE)
-
-    @registrar.qq.on_private_command("#待办-简洁模式")
-    async def set_private_concise_mode(self, event: PrivateMessageEvent):
-        """把当前用户在私聊中的提醒模式切换为简洁模式。
-
-        Args:
-            event: 触发命令的私聊消息事件。
-        """
-
-        await self._switch_mode(event, *self._private_context(event), MODE_CONCISE)
-
-    @registrar.qq.on_group_command("#完成待办")
-    async def complete_group_todo(self, event: GroupMessageEvent, target: str = ""):
-        """完成当前用户在当前群内的一条待办。
-
-        Args:
-            event: 触发命令的群消息事件。
-            target: 当前群和当前用户范围内的待办序号。
-        """
-
-        await self._complete_todo(event, *self._group_context(event), target)
-
-    @registrar.qq.on_private_command("#完成待办")
-    async def complete_private_todo(self, event: PrivateMessageEvent, target: str = ""):
-        """完成当前用户在私聊中的一条待办。
-
-        Args:
-            event: 触发命令的私聊消息事件。
-            target: 当前私聊用户范围内的待办序号。
-        """
-
-        await self._complete_todo(event, *self._private_context(event), target)
-
-    @registrar.qq.on_group_command("#删除待办")
-    async def delete_group_todo(self, event: GroupMessageEvent, target: str = ""):
-        """软删除当前用户在当前群内的一条待办。
-
-        Args:
-            event: 触发命令的群消息事件。
-            target: 当前群和当前用户范围内的待办序号。
-        """
-
-        await self._delete_todo(event, *self._group_context(event), target)
-
-    @registrar.qq.on_private_command("#删除待办")
-    async def delete_private_todo(self, event: PrivateMessageEvent, target: str = ""):
-        """软删除当前用户在私聊中的一条待办。
-
-        Args:
-            event: 触发命令的私聊消息事件。
-            target: 当前私聊用户范围内的待办序号。
-        """
-
-        await self._delete_todo(event, *self._private_context(event), target)
 
     def _group_context(self, event: GroupMessageEvent) -> tuple[str, str | None, str]:
         """生成群聊命令使用的待办范围参数。
@@ -327,7 +228,14 @@ class TodoReminderPlugin(NcatBotPlugin):
         group_id: str | None,
         user_id: str,
     ) -> None:
-        """回复当前范围内的已完成待办列表。"""
+        """回复当前范围内的已完成待办列表。
+
+        Args:
+            event: 触发命令的消息事件，用于回复用户。
+            scope: 待办来源范围，取值为 `group` 或 `private`。
+            group_id: 群号；私聊待办传入 None。
+            user_id: 创建人 QQ 号。
+        """
 
         items = self.store.list_completed(scope, group_id, user_id)
         await event.reply(self._format_todo_list("已完成待办", items))
@@ -354,85 +262,6 @@ class TodoReminderPlugin(NcatBotPlugin):
         mode_name = "猫娘" if mode == MODE_CATGIRL else "简洁"
         await event.reply(f"已切换为{mode_name}模式，之后到点提醒会使用{mode_name}文案")
 
-    async def _add_todo(
-        self,
-        event: GroupMessageEvent | PrivateMessageEvent,
-        scope: str,
-        group_id: str | None,
-        user_id: str,
-        content: str,
-    ) -> None:
-        """创建待办提醒的通用实现。
-
-        Args:
-            event: 触发命令的消息事件，用于回复用户。
-            scope: 待办来源范围，取值为 `group` 或 `private`。
-            group_id: 群号；私聊待办传入 None。
-            user_id: 创建人 QQ 号。
-            content: 用户输入的自然语言待办内容。
-        """
-
-        preprocessed = preprocess_hash_todo_content(content)
-        if preprocessed.route == TODO_PREPROCESS_PENDING:
-            await self._list_todos(event, scope, group_id, user_id)
-            return
-        if preprocessed.route == TODO_PREPROCESS_COMPLETED:
-            await self._list_completed_todos(event, scope, group_id, user_id)
-            return
-        if preprocessed.route == TODO_PREPROCESS_CLARIFY:
-            await event.reply(preprocessed.clarify_message)
-            return
-        if preprocessed.route != TODO_PREPROCESS_TOOL_LOOP:
-            return
-
-        await self._run_todo_tool_loop(
-            event,
-            scope,
-            group_id,
-            user_id,
-            preprocessed.normalized_text,
-        )
-
-    async def _complete_todo(
-        self,
-        event: GroupMessageEvent | PrivateMessageEvent,
-        scope: str,
-        group_id: str | None,
-        user_id: str,
-        target: str,
-    ) -> None:
-        """完成待办的通用实现。
-
-        Args:
-            event: 触发命令的消息事件，用于回复用户。
-            scope: 待办来源范围，取值为 `group` 或 `private`。
-            group_id: 群号；私聊待办传入 None。
-            user_id: 创建人 QQ 号。
-            target: 用户输入的范围内待办序号。
-        """
-
-        await self._run_todo_tool_loop(event, scope, group_id, user_id, f"完成待办 {target}")
-
-    async def _delete_todo(
-        self,
-        event: GroupMessageEvent | PrivateMessageEvent,
-        scope: str,
-        group_id: str | None,
-        user_id: str,
-        target: str,
-    ) -> None:
-        """软删除待办的通用实现。
-
-        Args:
-            event: 触发命令的消息事件，用于回复用户。
-            scope: 待办来源范围，取值为 `group` 或 `private`。
-            group_id: 群号；私聊待办传入 None。
-            user_id: 创建人 QQ 号。
-            target: 用户输入的范围内待办序号。
-        """
-
-        await self._run_todo_tool_loop(event, scope, group_id, user_id, f"取消待办 {target}")
-
     async def _route_todo_message(
         self,
         event: GroupMessageEvent | PrivateMessageEvent,
@@ -440,29 +269,26 @@ class TodoReminderPlugin(NcatBotPlugin):
         group_id: str | None,
         user_id: str,
     ) -> None:
-        """普通消息的 Todo 程序路由。"""
+        """普通消息的 Todo 程序路由。
+
+        确定性查询请求在这里直接处理；写操作和时间调整类自然语言请求进入
+        Tool Loop；不属于 Todo 的消息直接忽略。
+
+        Args:
+            event: 收到的群聊或私聊消息事件。
+            scope: 待办来源范围，取值为 `group` 或 `private`。
+            group_id: 群号；私聊待办传入 None。
+            user_id: 创建人 QQ 号。
+        """
 
         text = _event_text(event)
-        preprocessed = preprocess_todo_command(text)
-        if preprocessed.is_hash_todo:
-            if preprocessed.route == TODO_PREPROCESS_PENDING:
-                await self._list_todos(event, scope, group_id, user_id)
-                return
-            if preprocessed.route == TODO_PREPROCESS_COMPLETED:
-                await self._list_completed_todos(event, scope, group_id, user_id)
-                return
-            if preprocessed.route == TODO_PREPROCESS_CLARIFY:
-                await event.reply(preprocessed.clarify_message)
-                return
-            if preprocessed.route == TODO_PREPROCESS_TOOL_LOOP:
-                await self._run_todo_tool_loop(
-                    event,
-                    scope,
-                    group_id,
-                    user_id,
-                    preprocessed.normalized_text,
-                )
-                return
+        normalized = " ".join(text.strip().split())
+        if normalized in _MODE_CATGIRL_TEXTS:
+            await self._switch_mode(event, scope, group_id, user_id, MODE_CATGIRL)
+            return
+        if normalized in _MODE_CONCISE_TEXTS:
+            await self._switch_mode(event, scope, group_id, user_id, MODE_CONCISE)
+            return
 
         route = classify_todo_route(text)
         if route == TODO_ROUTE_NONE:
@@ -483,7 +309,15 @@ class TodoReminderPlugin(NcatBotPlugin):
         user_id: str,
         user_text: str,
     ) -> None:
-        """执行 Todo Tool Loop 并基于真实工具结果回复。"""
+        """执行 Todo Tool Loop 并基于真实工具结果回复。
+
+        Args:
+            event: 收到的群聊或私聊消息事件。
+            scope: 待办来源范围，取值为 `group` 或 `private`。
+            group_id: 群号；私聊待办传入 None。
+            user_id: 创建人 QQ 号。
+            user_text: 交给 Tool Loop 的规范化用户文本。
+        """
 
         context = self._tool_context(scope, group_id, user_id, user_text)
         try:
@@ -509,7 +343,17 @@ class TodoReminderPlugin(NcatBotPlugin):
         user_id: str,
         user_text: str,
     ) -> TodoToolContext:
-        """构造传给后端工具的可信上下文。"""
+        """构造传给后端工具的可信上下文。
+
+        Args:
+            scope: 待办来源范围，取值为 `group` 或 `private`。
+            group_id: 群号；私聊待办传入 None。
+            user_id: 创建人 QQ 号。
+            user_text: 交给 Tool Loop 的用户文本。
+
+        Returns:
+            后端工具执行器使用的可信上下文。
+        """
 
         return TodoToolContext(
             scope=scope,
@@ -531,7 +375,16 @@ class TodoReminderPlugin(NcatBotPlugin):
         user_id: str,
         results: list[Any],
     ) -> None:
-        """记录最后一次工具操作涉及的用户可见编号，支持“刚才那个”等引用。"""
+        """记录最后一次工具操作涉及的用户可见编号。
+
+        支持用户后续用“刚才那个”“上一条”等引用词操作同一条待办。
+
+        Args:
+            scope: 待办来源范围，取值为 `group` 或 `private`。
+            group_id: 群号；私聊待办传入 None。
+            user_id: 创建人 QQ 号。
+            results: Tool Loop 返回的结构化工具结果列表。
+        """
 
         key = self._context_key(scope, group_id, user_id)
         for result in results:
@@ -545,10 +398,24 @@ class TodoReminderPlugin(NcatBotPlugin):
 
     @staticmethod
     def _context_key(scope: str, group_id: str | None, user_id: str) -> tuple[str, str, str]:
+        """生成记录最近操作编号的上下文键。
+
+        Args:
+            scope: 待办来源范围。
+            group_id: 群号；私聊待办传入 None。
+            user_id: 创建人 QQ 号。
+
+        Returns:
+            可作为字典键使用的稳定三元组。
+        """
+
         return scope, group_id or "", user_id
 
     async def check_due_todos(self) -> None:
-        """定时扫描到期待办，并按来源发送群聊或私聊提醒。"""
+        """定时扫描到期待办，并按来源发送群聊或私聊提醒。
+
+        发送成功后才标记为已提醒并自动软删除，避免消息发送失败时丢失提醒。
+        """
 
         if self._checking_due:
             return
@@ -583,12 +450,7 @@ class TodoReminderPlugin(NcatBotPlugin):
             item: 已到期且尚未提醒的待办记录。
         """
 
-        mode = self._reminder_mode(item.scope, item.group_id, item.user_id)
-        text = render_reminder_text(
-            item.title,
-            item.content or item.reminder_text or None,
-            mode,
-        )
+        text = item.reminder_text or f"待办提醒：{item.title}"
 
         if item.scope == SCOPE_GROUP and item.group_id:
             message = MessageArray().add_at(item.user_id).add_text(f" {text}")
@@ -597,12 +459,21 @@ class TodoReminderPlugin(NcatBotPlugin):
         await self.api.qq.send_private_text(item.user_id, text)
 
     def _reminder_mode(self, scope: str, group_id: str | None, user_id: str) -> str:
-        """获取当前提醒展示风格。"""
+        """获取当前提醒展示风格。
+
+        Args:
+            scope: 待办来源范围，取值为 `group` 或 `private`。
+            group_id: 群号；私聊待办传入 None。
+            user_id: 创建人 QQ 号。
+
+        Returns:
+            当前范围内的提醒风格；未设置或配置非法时返回 `concise`。
+        """
 
         mode = self.store.get_mode(scope, group_id, user_id)
         if mode not in {MODE_CONCISE, MODE_CATGIRL}:
-            configured = str(self.get_config("default_reminder_mode", MODE_CATGIRL) or MODE_CATGIRL)
-            return configured if configured in {MODE_CONCISE, MODE_CATGIRL} else MODE_CATGIRL
+            configured = str(self.get_config("default_reminder_mode", MODE_CONCISE) or MODE_CONCISE)
+            return configured if configured in {MODE_CONCISE, MODE_CATGIRL} else MODE_CONCISE
         return mode
 
     def _resolve_target(
@@ -642,7 +513,15 @@ class TodoReminderPlugin(NcatBotPlugin):
         return self._format_todo_list("待办列表", items)
 
     def _format_todo_list(self, title: str, items: list[TodoReminder]) -> str:
-        """格式化任意状态的待办列表。"""
+        """格式化任意状态的待办列表。
+
+        Args:
+            title: 列表标题。
+            items: 待展示的待办列表。
+
+        Returns:
+            可直接发送给用户的列表文本。
+        """
 
         if not items:
             return "当前没有未完成待办。" if title == "待办列表" else f"当前没有{title}。"
@@ -728,7 +607,11 @@ class TodoReminderPlugin(NcatBotPlugin):
 
     @staticmethod
     def _now() -> int:
-        """获取当前 Unix 秒级时间戳。"""
+        """获取当前 Unix 秒级时间戳。
+
+        Returns:
+            当前 Unix 秒级时间戳。
+        """
 
         return int(time.time())
 
@@ -751,6 +634,9 @@ def _truncate(text: str, limit: int) -> str:
 def classify_todo_route(text: str) -> str:
     """判断一条普通消息是否应进入 Todo 路由。
 
+    Args:
+        text: 用户原始消息文本。
+
     Returns:
         `pending` 和 `completed` 表示确定性查询路径；`tool_loop` 表示写操作
         交给 LLM 选择工具；`none` 表示不是 Todo 请求。
@@ -771,7 +657,7 @@ def classify_todo_route(text: str) -> str:
         return TODO_ROUTE_TOOL_LOOP
     if not any(keyword in normalized for keyword in _TODO_WRITE_KEYWORDS):
         return TODO_ROUTE_NONE
-    if normalized.startswith(("新增", "添加", "创建", "新建", "加个", "加一条")):
+    if normalized.startswith(_TODO_CREATE_PREFIXES):
         return TODO_ROUTE_TOOL_LOOP
     if "待办" in normalized or "todo" in lowered:
         return TODO_ROUTE_TOOL_LOOP
@@ -783,11 +669,27 @@ def classify_todo_route(text: str) -> str:
 
 
 def _contains_number_reference(text: str) -> bool:
+    """判断文本里是否包含可见编号引用。
+
+    Args:
+        text: 用户消息文本。
+
+    Returns:
+        包含阿拉伯数字或常见中文数字字符时返回 True。
+    """
+
     return any(char.isdigit() for char in text) or any(char in _CHINESE_NUMBER_CHARS for char in text)
 
 
 def _event_text(event: GroupMessageEvent | PrivateMessageEvent) -> str:
-    """从 NcatBot 消息事件中提取纯文本。"""
+    """从 NcatBot 消息事件中提取纯文本。
+
+    Args:
+        event: 群聊或私聊消息事件。
+
+    Returns:
+        优先返回消息段中的文本；解析失败时回退到 raw_message。
+    """
 
     message = getattr(event, "message", None)
     if message is not None:

@@ -314,7 +314,17 @@ class TodoStore:
         user_id: str,
         limit: int = 20,
     ) -> list[TodoReminder]:
-        """列出指定范围内某个用户的已完成待办。"""
+        """列出指定范围内某个用户的已完成待办。
+
+        Args:
+            scope: 待办来源范围，取值为 `group` 或 `private`。
+            group_id: 群号；私聊待办传入 None。
+            user_id: 创建人 QQ 号。
+            limit: 最多返回多少条。
+
+        Returns:
+            状态为 `done` 的待办列表。
+        """
 
         return self.list_by_status(scope, group_id, user_id, STATUS_DONE, limit)
 
@@ -428,6 +438,12 @@ class TodoStore:
 
         恢复时如果原展示编号已经被新的未完成待办占用，会重新分配当前范围内
         最小可用编号，避免破坏未完成待办编号唯一约束。
+
+        Args:
+            todo_id: 待办内部主键 ID。
+
+        Returns:
+            恢复后的待办记录；待办不存在或状态不是可恢复状态时返回 None。
         """
 
         with self._connect() as conn:
@@ -478,7 +494,14 @@ class TodoStore:
         return _row_to_todo(restored) if restored is not None else None
 
     def delete_permanent(self, todo_id: int) -> bool:
-        """永久删除一条待办记录。"""
+        """永久删除一条待办记录。
+
+        Args:
+            todo_id: 待办内部主键 ID。
+
+        Returns:
+            确实删除了记录时返回 True；目标不存在时返回 False。
+        """
 
         with self._connect() as conn:
             cursor = conn.execute(
@@ -601,7 +624,7 @@ class TodoStore:
             user_id: 创建人 QQ 号。
 
         Returns:
-            提醒模式，未设置时返回 `catgirl`。
+            提醒模式，未设置时返回 `concise`。
         """
 
         with self._connect() as conn:
@@ -616,9 +639,9 @@ class TodoStore:
                 (scope, _group_key(group_id), user_id),
             ).fetchone()
         if row is None:
-            return MODE_CATGIRL
+            return MODE_CONCISE
         mode = str(row["mode"])
-        return mode if mode in {MODE_CONCISE, MODE_CATGIRL} else MODE_CATGIRL
+        return mode if mode in {MODE_CONCISE, MODE_CATGIRL} else MODE_CONCISE
 
     def set_mode(
         self,
@@ -1014,13 +1037,27 @@ def _row_to_todo(row: sqlite3.Row) -> TodoReminder:
 
 
 def _optional_int(value: Any) -> int | None:
-    """把可空数据库字段转换为可空整数。"""
+    """把可空数据库字段转换为可空整数。
+
+    Args:
+        value: SQLite 行中的字段值。
+
+    Returns:
+        None 或整数值。
+    """
 
     return None if value is None else int(value)
 
 
 def _positive_todo_no(value: Any) -> int | None:
-    """把数据库里的待办序号转换为正整数，非法值返回 None。"""
+    """把数据库里的待办序号转换为正整数，非法值返回 None。
+
+    Args:
+        value: SQLite 行中的 todo_no 字段值。
+
+    Returns:
+        合法正整数序号；空值、非数字或非正数返回 None。
+    """
 
     try:
         parsed = _optional_int(value)
@@ -1046,6 +1083,13 @@ def _first_available_todo_no(used_numbers: set[int]) -> int:
 
 
 def _group_key(group_id: str | None) -> str:
-    """把可空群号转换为模式表里的稳定键。"""
+    """把可空群号转换为模式表里的稳定键。
+
+    Args:
+        group_id: 群号；私聊场景传入 None。
+
+    Returns:
+        用于联合主键的字符串，私聊场景固定为空字符串。
+    """
 
     return "" if group_id is None else str(group_id)
