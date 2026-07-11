@@ -8,7 +8,7 @@ from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 
 TODO_DB_FILENAME = "todos.sqlite"
@@ -253,6 +253,71 @@ class TodoStore:
             ).fetchall()
         return [_row_to_todo(row) for row in rows]
 
+    def list_by_status(
+        self,
+        scope: str,
+        group_id: str | None,
+        user_id: str,
+        status: str | None = STATUS_OPEN,
+        limit: int = 20,
+    ) -> list[TodoReminder]:
+        """列出指定范围内某个用户的待办。
+
+        Args:
+            scope: 待办来源范围，取值为 `group` 或 `private`。
+            group_id: 群号；私聊待办传入 None。
+            user_id: 创建人 QQ 号。
+            status: 待办状态；传入 None 时返回所有状态。
+            limit: 最多返回多少条。
+
+        Returns:
+            当前用户在当前范围内的待办列表。
+        """
+
+        where_status = ""
+        params: list[Any] = [scope, group_id, user_id]
+        if status is not None:
+            where_status = "AND status = ?"
+            params.append(status)
+        params.append(int(limit))
+
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT *
+                FROM todo_reminders
+                WHERE scope = ?
+                  AND COALESCE(group_id, '') = COALESCE(?, '')
+                  AND user_id = ?
+                  {where_status}
+                ORDER BY
+                  CASE status
+                    WHEN 'open' THEN 0
+                    WHEN 'done' THEN 1
+                    WHEN 'deleted' THEN 2
+                    ELSE 3
+                  END,
+                  remind_at IS NULL,
+                  remind_at,
+                  created_at DESC,
+                  id DESC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+        return [_row_to_todo(row) for row in rows]
+
+    def list_completed(
+        self,
+        scope: str,
+        group_id: str | None,
+        user_id: str,
+        limit: int = 20,
+    ) -> list[TodoReminder]:
+        """列出指定范围内某个用户的已完成待办。"""
+
+        return self.list_by_status(scope, group_id, user_id, STATUS_DONE, limit)
+
     def find_pending_by_no(
         self,
         scope: str,
@@ -274,19 +339,63 @@ class TodoStore:
 
         if todo_no <= 0:
             return None
+        return self.find_by_no(scope, group_id, user_id, todo_no, (STATUS_OPEN,))
+
+    def find_by_no(
+        self,
+        scope: str,
+        group_id: str | None,
+        user_id: str,
+        todo_no: int,
+        statuses: Sequence[str] | None = None,
+    ) -> TodoReminder | None:
+        """按用户可见编号查找当前范围内的一条待办。
+
+        Args:
+            scope: 待办来源范围，取值为 `group` 或 `private`。
+            group_id: 群号；私聊待办传入 None。
+            user_id: 创建人 QQ 号。
+            todo_no: 当前范围内展示给用户的待办序号。
+            statuses: 允许匹配的状态；传入 None 时允许所有状态。
+
+        Returns:
+            匹配到的待办；没有匹配时返回 None。
+        """
+
+        if todo_no <= 0:
+            return None
+
+        status_sql = ""
+        params: list[Any] = [scope, group_id, user_id, int(todo_no)]
+        if statuses is not None:
+            if not statuses:
+                return None
+            placeholders = ",".join("?" for _ in statuses)
+            status_sql = f"AND status IN ({placeholders})"
+            params.extend(statuses)
+
         with self._connect() as conn:
             row = conn.execute(
-                """
+                f"""
                 SELECT *
                 FROM todo_reminders
                 WHERE scope = ?
                   AND COALESCE(group_id, '') = COALESCE(?, '')
                   AND user_id = ?
                   AND todo_no = ?
-                  AND status = ?
+                  {status_sql}
+                ORDER BY
+                  CASE status
+                    WHEN 'open' THEN 0
+                    WHEN 'done' THEN 1
+                    WHEN 'deleted' THEN 2
+                    ELSE 3
+                  END,
+                  created_at DESC,
+                  id DESC
                 LIMIT 1
                 """,
-                (scope, group_id, user_id, int(todo_no), STATUS_OPEN),
+                params,
             ).fetchone()
         return _row_to_todo(row) if row is not None else None
 
@@ -313,6 +422,127 @@ class TodoStore:
         """
 
         return self._transition(todo_id, STATUS_OPEN, STATUS_DELETED)
+
+    def restore(self, todo_id: int) -> TodoReminder | None:
+        """把已完成或已删除的待办恢复为未完成。
+
+        恢复时如果原展示编号已经被新的未完成待办占用，会重新分配当前范围内
+        最小可用编号，避免破坏未完成待办编号唯一约束。
+        """
+
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM todo_reminders WHERE id = ?",
+                (int(todo_id),),
+            ).fetchone()
+            if row is None:
+                return None
+            item = _row_to_todo(row)
+            if item.status not in {STATUS_DONE, STATUS_DELETED}:
+                return None
+
+            used_numbers = self._used_open_todo_numbers(
+                conn,
+                item.scope,
+                item.group_id,
+                item.user_id,
+            )
+            todo_no = item.todo_no
+            if todo_no in used_numbers:
+                todo_no = _first_available_todo_no(used_numbers)
+
+            cursor = conn.execute(
+                """
+                UPDATE todo_reminders
+                SET status = ?,
+                    reminded_at = NULL,
+                    todo_no = ?
+                WHERE id = ?
+                  AND status IN (?, ?)
+                """,
+                (
+                    STATUS_OPEN,
+                    todo_no,
+                    int(todo_id),
+                    STATUS_DONE,
+                    STATUS_DELETED,
+                ),
+            )
+            if cursor.rowcount == 0:
+                return None
+            restored = conn.execute(
+                "SELECT * FROM todo_reminders WHERE id = ?",
+                (int(todo_id),),
+            ).fetchone()
+        return _row_to_todo(restored) if restored is not None else None
+
+    def delete_permanent(self, todo_id: int) -> bool:
+        """永久删除一条待办记录。"""
+
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "DELETE FROM todo_reminders WHERE id = ?",
+                (int(todo_id),),
+            )
+        return cursor.rowcount > 0
+
+    def update_fields(
+        self,
+        todo_id: int,
+        updates: dict[str, Any],
+        expected_status: str | None = STATUS_OPEN,
+    ) -> TodoReminder | None:
+        """更新一条待办的可编辑字段。
+
+        Args:
+            todo_id: 待办内部主键 ID。
+            updates: 待更新字段和值，只允许标题、内容和时间等业务字段。
+            expected_status: 允许更新的当前状态；传入 None 时不校验状态。
+
+        Returns:
+            更新后的待办记录；待办不存在或状态不匹配时返回 None。
+        """
+
+        allowed_fields = {
+            "title",
+            "content",
+            "raw_text",
+            "remind_at",
+            "due_at",
+            "reminder_text",
+        }
+        unknown_fields = set(updates) - allowed_fields
+        if unknown_fields:
+            raise ValueError(f"unsupported todo fields: {sorted(unknown_fields)}")
+        if not updates:
+            raise ValueError("updates cannot be empty")
+
+        assignments = ", ".join(f"{field} = ?" for field in updates)
+        params: list[Any] = list(updates.values())
+        params.append(int(todo_id))
+        status_sql = ""
+        if expected_status is not None:
+            status_sql = "AND status = ?"
+            params.append(expected_status)
+
+        with self._connect() as conn:
+            cursor = conn.execute(
+                f"""
+                UPDATE todo_reminders
+                SET {assignments}
+                WHERE id = ?
+                  {status_sql}
+                """,
+                params,
+            )
+            if cursor.rowcount == 0:
+                return None
+            row = conn.execute(
+                "SELECT * FROM todo_reminders WHERE id = ?",
+                (int(todo_id),),
+            ).fetchone()
+        return _row_to_todo(row) if row is not None else None
 
     def due_pending(self, now: int, limit: int = 20) -> list[TodoReminder]:
         """查询已经到期但尚未提醒的未完成待办。
@@ -371,7 +601,7 @@ class TodoStore:
             user_id: 创建人 QQ 号。
 
         Returns:
-            提醒模式，未设置时返回 `concise`。
+            提醒模式，未设置时返回 `catgirl`。
         """
 
         with self._connect() as conn:
@@ -386,9 +616,9 @@ class TodoStore:
                 (scope, _group_key(group_id), user_id),
             ).fetchone()
         if row is None:
-            return MODE_CONCISE
+            return MODE_CATGIRL
         mode = str(row["mode"])
-        return mode if mode in {MODE_CONCISE, MODE_CATGIRL} else MODE_CONCISE
+        return mode if mode in {MODE_CONCISE, MODE_CATGIRL} else MODE_CATGIRL
 
     def set_mode(
         self,

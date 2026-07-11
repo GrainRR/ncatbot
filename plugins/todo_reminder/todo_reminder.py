@@ -12,13 +12,23 @@ from ncatbot.event.qq import GroupMessageEvent, PrivateMessageEvent
 from ncatbot.plugin import NcatBotPlugin
 from ncatbot.types import MessageArray
 
-from .llm_parser import TodoLlmParser, TodoParseError
+from .llm import TodoToolLoop
+from .llm_parser import (
+    TODO_PREPROCESS_CLARIFY,
+    TODO_PREPROCESS_COMPLETED,
+    TODO_PREPROCESS_PENDING,
+    TODO_PREPROCESS_TOOL_LOOP,
+    preprocess_hash_todo_content,
+    preprocess_todo_command,
+    render_reminder_text,
+)
+from .todo_manage_tools import TodoToolContext
 from .todo_store import (
     MODE_CATGIRL,
     MODE_CONCISE,
+    STATUS_DONE,
     TODO_DB_FILENAME,
     TodoReminder,
-    TodoReminderDraft,
     TodoStore,
     parse_pending_target_number,
 )
@@ -26,6 +36,66 @@ from .todo_store import (
 
 SCOPE_GROUP = "group"
 SCOPE_PRIVATE = "private"
+TODO_ROUTE_NONE = "none"
+TODO_ROUTE_PENDING = "pending"
+TODO_ROUTE_COMPLETED = "completed"
+TODO_ROUTE_TOOL_LOOP = "tool_loop"
+
+_PENDING_QUERY_TEXTS = {
+    "/todo",
+    "todo",
+    "查看待办",
+    "待办列表",
+    "查看待办列表",
+    "查看未完成",
+    "查看未完成待办",
+}
+_COMPLETED_QUERY_TEXTS = {
+    "/todo done",
+    "/todo 已完成",
+    "查看已完成",
+    "查看已完成待办",
+    "已完成待办",
+}
+_TODO_WRITE_KEYWORDS = (
+    "新增",
+    "添加",
+    "创建",
+    "新建",
+    "加个",
+    "加一条",
+    "完成",
+    "修改",
+    "更改",
+    "取消",
+    "恢复",
+    "删除",
+    "永久删除",
+    "合并",
+    "推迟",
+    "延后",
+    "提前",
+    "晚点",
+    "稍后",
+    "改提醒",
+    "改时间",
+    "提醒调整",
+)
+_TODO_REFERENCE_WORDS = (
+    "第",
+    "条",
+    "上一条",
+    "前一条",
+    "刚才那个",
+    "刚才那条",
+    "刚刚那个",
+    "刚刚那条",
+    "提醒",
+    "时间",
+    "分钟",
+    "小时",
+)
+_CHINESE_NUMBER_CHARS = set("一二三四五六七八九十两")
 
 
 class TodoReminderPlugin(NcatBotPlugin):
@@ -37,7 +107,8 @@ class TodoReminderPlugin(NcatBotPlugin):
     description = "LLM 待办提醒插件"
 
     store: TodoStore
-    parser: TodoLlmParser
+    tool_loop: TodoToolLoop
+    _last_todo_numbers: dict[tuple[str, str, str], int]
     _checking_due: bool
 
     async def on_load(self):
@@ -52,6 +123,7 @@ class TodoReminderPlugin(NcatBotPlugin):
                 "llm_model": "",
                 "llm_timeout_seconds": 30,
                 "timezone": "Asia/Shanghai",
+                "default_reminder_mode": MODE_CATGIRL,
                 "reminder_check_interval": "60s",
                 "max_pending_todos_per_scope": 100,
                 "max_due_reminders_per_check": 20,
@@ -60,7 +132,8 @@ class TodoReminderPlugin(NcatBotPlugin):
         )
         self.store = TodoStore(self.workspace / TODO_DB_FILENAME)
         self.store.init()
-        self.parser = TodoLlmParser(self.config)
+        self.tool_loop = TodoToolLoop(self.config, self.store)
+        self._last_todo_numbers = {}
         self._checking_due = False
         self.add_scheduled_task(
             "check_due_todos",
@@ -68,7 +141,6 @@ class TodoReminderPlugin(NcatBotPlugin):
         )
         self.logger.info("待办提醒数据库已就绪: %s", self.store.db_path)
 
-    @registrar.qq.on_group_command("#待办")
     async def add_group_todo(self, event: GroupMessageEvent, content: str = ""):
         """在群聊中创建个人待办提醒。
 
@@ -79,7 +151,6 @@ class TodoReminderPlugin(NcatBotPlugin):
 
         await self._add_todo(event, *self._group_context(event), content)
 
-    @registrar.qq.on_private_command("#待办")
     async def add_private_todo(self, event: PrivateMessageEvent, content: str = ""):
         """在私聊中创建待办提醒。
 
@@ -89,6 +160,18 @@ class TodoReminderPlugin(NcatBotPlugin):
         """
 
         await self._add_todo(event, *self._private_context(event), content)
+
+    @registrar.qq.on_group_message()
+    async def route_group_todo_message(self, event: GroupMessageEvent):
+        """把普通群消息中的 Todo 查询和写操作路由到确定性路径或 Tool Loop。"""
+
+        await self._route_todo_message(event, *self._group_context(event))
+
+    @registrar.qq.on_private_message()
+    async def route_private_todo_message(self, event: PrivateMessageEvent):
+        """把普通私聊消息中的 Todo 查询和写操作路由到确定性路径或 Tool Loop。"""
+
+        await self._route_todo_message(event, *self._private_context(event))
 
     @registrar.qq.on_group_command("#待办列表")
     async def list_group_todos(self, event: GroupMessageEvent):
@@ -237,6 +320,18 @@ class TodoReminderPlugin(NcatBotPlugin):
         items = self.store.list_pending(scope, group_id, user_id)
         await event.reply(self._format_pending_list(items))
 
+    async def _list_completed_todos(
+        self,
+        event: GroupMessageEvent | PrivateMessageEvent,
+        scope: str,
+        group_id: str | None,
+        user_id: str,
+    ) -> None:
+        """回复当前范围内的已完成待办列表。"""
+
+        items = self.store.list_completed(scope, group_id, user_id)
+        await event.reply(self._format_todo_list("已完成待办", items))
+
     async def _switch_mode(
         self,
         event: GroupMessageEvent | PrivateMessageEvent,
@@ -257,7 +352,7 @@ class TodoReminderPlugin(NcatBotPlugin):
 
         self.store.set_mode(scope, group_id, user_id, mode, self._now())
         mode_name = "猫娘" if mode == MODE_CATGIRL else "简洁"
-        await event.reply(f"已切换为{mode_name}模式，之后创建的待办会使用{mode_name}提醒文案")
+        await event.reply(f"已切换为{mode_name}模式，之后到点提醒会使用{mode_name}文案")
 
     async def _add_todo(
         self,
@@ -277,119 +372,26 @@ class TodoReminderPlugin(NcatBotPlugin):
             content: 用户输入的自然语言待办内容。
         """
 
-        content = content.strip()
-        if not content:
-            self.logger.info(
-                "待办设置失败: scope=%s group_id=%s user_id=%s reason=empty_content",
-                scope,
-                group_id,
-                user_id,
-            )
-            await event.reply("请使用：#待办 明天 20:00 提醒我交作业")
+        preprocessed = preprocess_hash_todo_content(content)
+        if preprocessed.route == TODO_PREPROCESS_PENDING:
+            await self._list_todos(event, scope, group_id, user_id)
+            return
+        if preprocessed.route == TODO_PREPROCESS_COMPLETED:
+            await self._list_completed_todos(event, scope, group_id, user_id)
+            return
+        if preprocessed.route == TODO_PREPROCESS_CLARIFY:
+            await event.reply(preprocessed.clarify_message)
+            return
+        if preprocessed.route != TODO_PREPROCESS_TOOL_LOOP:
             return
 
-        max_pending = _positive_int(self.get_config("max_pending_todos_per_scope"), 100)
-        if self.store.count_pending(scope, group_id, user_id) >= max_pending:
-            self.logger.info(
-                "待办设置失败: scope=%s group_id=%s user_id=%s reason=max_pending limit=%s raw=%s",
-                scope,
-                group_id,
-                user_id,
-                max_pending,
-                _truncate(content, 100),
-            )
-            await event.reply(f"未完成待办已经达到上限 {max_pending} 条，请先完成或删除一些待办")
-            return
-
-        try:
-            # LLM 只负责把自然语言转成结构化草稿，真正写库仍由插件端校验后完成。
-            reminder_mode = self.store.get_mode(scope, group_id, user_id)
-            parsed_items = await self.parser.parse(content, reminder_mode)
-        except TodoParseError as exc:
-            self.logger.info(
-                "待办设置失败: scope=%s group_id=%s user_id=%s reason=parse_error detail=%s raw=%s",
-                scope,
-                group_id,
-                user_id,
-                exc,
-                _truncate(content, 100),
-            )
-            await event.reply(str(exc))
-            return
-        except Exception as exc:
-            self.logger.exception(
-                "待办设置失败: scope=%s group_id=%s user_id=%s reason=unexpected_parse_error raw=%s error=%s",
-                scope,
-                group_id,
-                user_id,
-                _truncate(content, 100),
-                exc,
-            )
-            await event.reply("解析待办失败，待办没有写入")
-            return
-
-        pending_count = self.store.count_pending(scope, group_id, user_id)
-        if pending_count + len(parsed_items) > max_pending:
-            self.logger.info(
-                "待办设置失败: scope=%s group_id=%s user_id=%s reason=max_pending_after_parse limit=%s current=%s parsed=%s raw=%s",
-                scope,
-                group_id,
-                user_id,
-                max_pending,
-                pending_count,
-                len(parsed_items),
-                _truncate(content, 100),
-            )
-            await event.reply(
-                f"这次会创建 {len(parsed_items)} 条待办，未完成待办将超过上限 {max_pending} 条，"
-                "请先完成或删除一些待办"
-            )
-            return
-
-        drafts = [
-            TodoReminderDraft(
-                title=parsed.title,
-                content=None,
-                raw_text=content,
-                remind_at=int(parsed.remind_at.timestamp()) if parsed.remind_at else None,
-                due_at=int(parsed.due_at.timestamp()) if parsed.due_at else None,
-                reminder_text=parsed.reminder_text,
-                llm_json=parsed.raw_json,
-            )
-            for parsed in parsed_items
-        ]
-        try:
-            todos = self.store.create_many(
-                scope=scope,
-                group_id=group_id,
-                user_id=user_id,
-                drafts=drafts,
-                now=self._now(),
-            )
-        except Exception as exc:
-            self.logger.exception(
-                "待办设置失败: scope=%s group_id=%s user_id=%s reason=store_error raw=%s error=%s",
-                scope,
-                group_id,
-                user_id,
-                _truncate(content, 100),
-                exc,
-            )
-            await event.reply("保存待办失败，待办没有写入")
-            return
-
-        for todo in todos:
-            self.logger.info(
-                "待办设置成功: scope=%s group_id=%s user_id=%s id=%s todo_no=%s remind_at=%s title=%s",
-                scope,
-                group_id,
-                user_id,
-                todo.id,
-                todo.todo_no,
-                todo.remind_at,
-                _truncate(todo.title, 100),
-            )
-        await event.reply(self._format_created_todos(todos))
+        await self._run_todo_tool_loop(
+            event,
+            scope,
+            group_id,
+            user_id,
+            preprocessed.normalized_text,
+        )
 
     async def _complete_todo(
         self,
@@ -409,15 +411,7 @@ class TodoReminderPlugin(NcatBotPlugin):
             target: 用户输入的范围内待办序号。
         """
 
-        item = self._resolve_target(scope, group_id, user_id, target)
-        if item is None:
-            await event.reply("请先发送 #待办列表 查看待办序号，再使用 #完成待办 1")
-            return
-        completed = self.store.complete(item.id)
-        if completed is None:
-            await event.reply("这条待办已经不是未完成状态")
-            return
-        await event.reply(f"已完成待办：{self._format_inline(completed)}")
+        await self._run_todo_tool_loop(event, scope, group_id, user_id, f"完成待办 {target}")
 
     async def _delete_todo(
         self,
@@ -437,15 +431,121 @@ class TodoReminderPlugin(NcatBotPlugin):
             target: 用户输入的范围内待办序号。
         """
 
-        item = self._resolve_target(scope, group_id, user_id, target)
-        if item is None:
-            await event.reply("请先发送 #待办列表 查看待办序号，再使用 #删除待办 1")
+        await self._run_todo_tool_loop(event, scope, group_id, user_id, f"取消待办 {target}")
+
+    async def _route_todo_message(
+        self,
+        event: GroupMessageEvent | PrivateMessageEvent,
+        scope: str,
+        group_id: str | None,
+        user_id: str,
+    ) -> None:
+        """普通消息的 Todo 程序路由。"""
+
+        text = _event_text(event)
+        preprocessed = preprocess_todo_command(text)
+        if preprocessed.is_hash_todo:
+            if preprocessed.route == TODO_PREPROCESS_PENDING:
+                await self._list_todos(event, scope, group_id, user_id)
+                return
+            if preprocessed.route == TODO_PREPROCESS_COMPLETED:
+                await self._list_completed_todos(event, scope, group_id, user_id)
+                return
+            if preprocessed.route == TODO_PREPROCESS_CLARIFY:
+                await event.reply(preprocessed.clarify_message)
+                return
+            if preprocessed.route == TODO_PREPROCESS_TOOL_LOOP:
+                await self._run_todo_tool_loop(
+                    event,
+                    scope,
+                    group_id,
+                    user_id,
+                    preprocessed.normalized_text,
+                )
+                return
+
+        route = classify_todo_route(text)
+        if route == TODO_ROUTE_NONE:
             return
-        deleted = self.store.cancel(item.id)
-        if deleted is None:
-            await event.reply("这条待办已经不是未完成状态")
+        if route == TODO_ROUTE_PENDING:
+            await self._list_todos(event, scope, group_id, user_id)
             return
-        await event.reply(f"已删除待办：{self._format_inline(deleted)}")
+        if route == TODO_ROUTE_COMPLETED:
+            await self._list_completed_todos(event, scope, group_id, user_id)
+            return
+        await self._run_todo_tool_loop(event, scope, group_id, user_id, text)
+
+    async def _run_todo_tool_loop(
+        self,
+        event: GroupMessageEvent | PrivateMessageEvent,
+        scope: str,
+        group_id: str | None,
+        user_id: str,
+        user_text: str,
+    ) -> None:
+        """执行 Todo Tool Loop 并基于真实工具结果回复。"""
+
+        context = self._tool_context(scope, group_id, user_id, user_text)
+        try:
+            response = await self.tool_loop.run(user_text, context)
+        except Exception as exc:
+            self.logger.exception(
+                "Todo Tool Loop 失败: scope=%s group_id=%s user_id=%s raw=%s error=%s",
+                scope,
+                group_id,
+                user_id,
+                _truncate(user_text, 100),
+                exc,
+            )
+            await event.reply(f"处理待办失败，数据库未变更：{exc}")
+            return
+        self._remember_tool_results(scope, group_id, user_id, response.tool_results)
+        await event.reply(response.message)
+
+    def _tool_context(
+        self,
+        scope: str,
+        group_id: str | None,
+        user_id: str,
+        user_text: str,
+    ) -> TodoToolContext:
+        """构造传给后端工具的可信上下文。"""
+
+        return TodoToolContext(
+            scope=scope,
+            group_id=group_id,
+            user_id=user_id,
+            now=self._now(),
+            timezone=self._timezone(),
+            max_pending=_positive_int(self.get_config("max_pending_todos_per_scope"), 100),
+            reject_past_reminder=bool(self.get_config("reject_past_reminder", True)),
+            last_todo_no=self._last_todo_numbers.get(self._context_key(scope, group_id, user_id)),
+            reminder_mode=self._reminder_mode(scope, group_id, user_id),
+            user_text=user_text,
+        )
+
+    def _remember_tool_results(
+        self,
+        scope: str,
+        group_id: str | None,
+        user_id: str,
+        results: list[Any],
+    ) -> None:
+        """记录最后一次工具操作涉及的用户可见编号，支持“刚才那个”等引用。"""
+
+        key = self._context_key(scope, group_id, user_id)
+        for result in results:
+            data = getattr(result, "data", {}) or {}
+            item = data.get("item")
+            if isinstance(item, dict) and isinstance(item.get("number"), int):
+                self._last_todo_numbers[key] = int(item["number"])
+            for item in data.get("items") or []:
+                if isinstance(item, dict) and isinstance(item.get("number"), int):
+                    self._last_todo_numbers[key] = int(item["number"])
+
+    @staticmethod
+    def _context_key(scope: str, group_id: str | None, user_id: str) -> tuple[str, str, str]:
+        return scope, group_id or "", user_id
 
     async def check_due_todos(self) -> None:
         """定时扫描到期待办，并按来源发送群聊或私聊提醒。"""
@@ -483,13 +583,27 @@ class TodoReminderPlugin(NcatBotPlugin):
             item: 已到期且尚未提醒的待办记录。
         """
 
-        text = item.reminder_text or f"待办提醒：{item.title}"
+        mode = self._reminder_mode(item.scope, item.group_id, item.user_id)
+        text = render_reminder_text(
+            item.title,
+            item.content or item.reminder_text or None,
+            mode,
+        )
 
         if item.scope == SCOPE_GROUP and item.group_id:
             message = MessageArray().add_at(item.user_id).add_text(f" {text}")
             await self.api.qq.post_group_array_msg(item.group_id, message)
             return
         await self.api.qq.send_private_text(item.user_id, text)
+
+    def _reminder_mode(self, scope: str, group_id: str | None, user_id: str) -> str:
+        """获取当前提醒展示风格。"""
+
+        mode = self.store.get_mode(scope, group_id, user_id)
+        if mode not in {MODE_CONCISE, MODE_CATGIRL}:
+            configured = str(self.get_config("default_reminder_mode", MODE_CATGIRL) or MODE_CATGIRL)
+            return configured if configured in {MODE_CONCISE, MODE_CATGIRL} else MODE_CATGIRL
+        return mode
 
     def _resolve_target(
         self,
@@ -525,14 +639,22 @@ class TodoReminderPlugin(NcatBotPlugin):
             可直接发送给用户的文本。
         """
 
+        return self._format_todo_list("待办列表", items)
+
+    def _format_todo_list(self, title: str, items: list[TodoReminder]) -> str:
+        """格式化任意状态的待办列表。"""
+
         if not items:
-            return "当前没有未完成待办。"
-        rows = ["待办列表："]
+            return "当前没有未完成待办。" if title == "待办列表" else f"当前没有{title}。"
+        rows = [f"{title}："]
         for item in items:
             row = (
                 f"{self._format_inline(item)}\n"
-                f"   提醒时间：{self._format_time(item.remind_at)}"
+                f"   提醒时间：{self._format_time(item.remind_at)}\n"
+                f"   截止时间：{self._format_time(item.due_at)}"
             )
+            if item.status == STATUS_DONE:
+                row += "\n   状态：已完成"
             if item.content:
                 row += f"\n   内容：{_truncate(item.content, 80)}"
             rows.append(row)
@@ -624,6 +746,60 @@ def _truncate(text: str, limit: int) -> str:
 
     text = text.strip()
     return text if len(text) <= limit else text[: limit - 1] + "..."
+
+
+def classify_todo_route(text: str) -> str:
+    """判断一条普通消息是否应进入 Todo 路由。
+
+    Returns:
+        `pending` 和 `completed` 表示确定性查询路径；`tool_loop` 表示写操作
+        交给 LLM 选择工具；`none` 表示不是 Todo 请求。
+    """
+
+    normalized = " ".join((text or "").strip().split())
+    if not normalized:
+        return TODO_ROUTE_NONE
+    if normalized.startswith("#"):
+        return TODO_ROUTE_NONE
+
+    lowered = normalized.lower()
+    if lowered in _PENDING_QUERY_TEXTS:
+        return TODO_ROUTE_PENDING
+    if lowered in _COMPLETED_QUERY_TEXTS:
+        return TODO_ROUTE_COMPLETED
+    if lowered.startswith("/todo "):
+        return TODO_ROUTE_TOOL_LOOP
+    if not any(keyword in normalized for keyword in _TODO_WRITE_KEYWORDS):
+        return TODO_ROUTE_NONE
+    if normalized.startswith(("新增", "添加", "创建", "新建", "加个", "加一条")):
+        return TODO_ROUTE_TOOL_LOOP
+    if "待办" in normalized or "todo" in lowered:
+        return TODO_ROUTE_TOOL_LOOP
+    if any(word in normalized for word in _TODO_REFERENCE_WORDS):
+        return TODO_ROUTE_TOOL_LOOP
+    if _contains_number_reference(normalized):
+        return TODO_ROUTE_TOOL_LOOP
+    return TODO_ROUTE_NONE
+
+
+def _contains_number_reference(text: str) -> bool:
+    return any(char.isdigit() for char in text) or any(char in _CHINESE_NUMBER_CHARS for char in text)
+
+
+def _event_text(event: GroupMessageEvent | PrivateMessageEvent) -> str:
+    """从 NcatBot 消息事件中提取纯文本。"""
+
+    message = getattr(event, "message", None)
+    if message is not None:
+        try:
+            parts = [str(segment.text) for segment in message.filter_text()]
+            return "".join(parts).strip()
+        except Exception:
+            pass
+    raw_message = getattr(event, "raw_message", None)
+    if raw_message is not None:
+        return str(raw_message).strip()
+    return ""
 
 
 def _positive_int(value: Any, default: int) -> int:
