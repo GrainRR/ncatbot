@@ -20,6 +20,8 @@ STATUS_DELETED = "deleted"
 MODE_CONCISE = "concise"
 MODE_CATGIRL = "catgirl"
 OPERATION_PERMANENT_DELETE = "permanent_delete"
+DELETION_REASON_USER_CANCEL = "user_cancel"
+DELETION_REASON_REMINDER_SENT = "reminder_sent"
 
 
 class ReminderTimeValidationError(ValueError):
@@ -29,6 +31,14 @@ class ReminderTimeValidationError(ValueError):
         self.remind_at = int(remind_at)
         self.now = int(now)
         super().__init__("remind_at must be later than now")
+
+
+class ReminderReconfigurationRequiredError(ValueError):
+    """恢复已发送提醒的待办时未重新指定未来提醒时间。"""
+
+    def __init__(self, history_ids: Sequence[str]) -> None:
+        self.history_ids = tuple(str(history_id) for history_id in history_ids)
+        super().__init__("a future remind_at is required to restore reminded todos")
 
 
 class TodoConfirmationError(ValueError):
@@ -81,6 +91,7 @@ class TodoReminder:
     status: str
     created_at: int
     reminded_at: int | None
+    deletion_reason: str | None
     llm_json: str | None
 
 
@@ -129,6 +140,7 @@ class TodoStore:
                     status TEXT NOT NULL DEFAULT 'open',
                     created_at INTEGER NOT NULL,
                     reminded_at INTEGER,
+                    deletion_reason TEXT,
                     llm_json TEXT
                 );
 
@@ -532,6 +544,7 @@ class TodoStore:
         user_id: str,
         now: int,
         reject_past_reminder: bool,
+        new_remind_at: int | None = None,
     ) -> list[TodoReminder] | None:
         """原子恢复多条历史待办，并在事务内复核提醒时间。"""
 
@@ -543,12 +556,24 @@ class TodoStore:
             items = self._load_exact_targets(conn, target_ids, str(user_id))
             if items is None or any(item.status not in {STATUS_DONE, STATUS_DELETED} for item in items):
                 return None
-            for item in items:
-                validate_remind_at(item.remind_at, now, reject_past_reminder)
+            reminded_history_ids = [
+                item.history_id
+                for item in items
+                if item.deletion_reason == DELETION_REASON_REMINDER_SENT
+                or item.reminded_at is not None
+            ]
+            if reminded_history_ids and new_remind_at is None:
+                raise ReminderReconfigurationRequiredError(reminded_history_ids)
+            restored_remind_at = [
+                new_remind_at if new_remind_at is not None else item.remind_at
+                for item in items
+            ]
+            for remind_at in restored_remind_at:
+                validate_remind_at(remind_at, now, reject_past_reminder)
 
             used_numbers = self._used_open_todo_numbers(conn, str(user_id))
             restored_ids: list[int] = []
-            for item in items:
+            for item, remind_at in zip(items, restored_remind_at, strict=True):
                 todo_no = item.todo_no
                 if todo_no in used_numbers:
                     todo_no = _first_available_todo_no(used_numbers)
@@ -556,13 +581,19 @@ class TodoStore:
                 cursor = conn.execute(
                     """
                     UPDATE todo_reminders
-                    SET status = ?, reminded_at = NULL, todo_no = ?, revision = revision + 1
+                    SET status = ?,
+                        remind_at = ?,
+                        reminded_at = NULL,
+                        deletion_reason = NULL,
+                        todo_no = ?,
+                        revision = revision + 1
                     WHERE id = ?
                       AND user_id = ?
                       AND status IN (?, ?)
                     """,
                     (
                         STATUS_OPEN,
+                        remind_at,
                         todo_no,
                         item.id,
                         str(user_id),
@@ -623,10 +654,18 @@ class TodoStore:
                 cursor = conn.execute(
                     """
                     UPDATE todo_reminders
-                    SET status = ?, revision = revision + 1
+                    SET status = ?,
+                        deletion_reason = ?,
+                        revision = revision + 1
                     WHERE id = ? AND user_id = ? AND status = ?
                     """,
-                    (STATUS_DELETED, item.id, str(user_id), STATUS_OPEN),
+                    (
+                        STATUS_DELETED,
+                        DELETION_REASON_USER_CANCEL,
+                        item.id,
+                        str(user_id),
+                        STATUS_OPEN,
+                    ),
                 )
                 if cursor.rowcount != 1:
                     return None
@@ -658,7 +697,13 @@ class TodoStore:
             更新后的待办记录；待办不存在或状态不是 `open` 时返回 None。
         """
 
-        return self._transition(todo_id, STATUS_OPEN, STATUS_DELETED, user_id)
+        return self._transition(
+            todo_id,
+            STATUS_OPEN,
+            STATUS_DELETED,
+            user_id,
+            deletion_reason=DELETION_REASON_USER_CANCEL,
+        )
 
     def restore(
         self,
@@ -666,6 +711,7 @@ class TodoStore:
         user_id: str | None = None,
         now: int | None = None,
         reject_past_reminder: bool = True,
+        new_remind_at: int | None = None,
     ) -> TodoReminder | None:
         """把已完成或已删除的待办恢复为未完成。
 
@@ -692,8 +738,14 @@ class TodoStore:
                 return None
             if item.status not in {STATUS_DONE, STATUS_DELETED}:
                 return None
+            if (
+                item.deletion_reason == DELETION_REASON_REMINDER_SENT
+                or item.reminded_at is not None
+            ) and new_remind_at is None:
+                raise ReminderReconfigurationRequiredError([item.history_id])
+            restored_remind_at = new_remind_at if new_remind_at is not None else item.remind_at
             validate_remind_at(
-                item.remind_at,
+                restored_remind_at,
                 int(time.time()) if now is None else int(now),
                 reject_past_reminder,
             )
@@ -707,7 +759,9 @@ class TodoStore:
                 """
                 UPDATE todo_reminders
                 SET status = ?,
+                    remind_at = ?,
                     reminded_at = NULL,
+                    deletion_reason = NULL,
                     todo_no = ?,
                     revision = revision + 1
                 WHERE id = ?
@@ -716,6 +770,7 @@ class TodoStore:
                 """,
                 (
                     STATUS_OPEN,
+                    restored_remind_at,
                     todo_no,
                     int(todo_id),
                     item.user_id,
@@ -961,7 +1016,12 @@ class TodoStore:
 
         with self._connect() as conn:
             user_sql = ""
-            params: list[Any] = [int(now), STATUS_DELETED, int(todo_id)]
+            params: list[Any] = [
+                int(now),
+                STATUS_DELETED,
+                DELETION_REASON_REMINDER_SENT,
+                int(todo_id),
+            ]
             if user_id is not None:
                 user_sql = "AND user_id = ?"
                 params.append(user_id)
@@ -971,6 +1031,7 @@ class TodoStore:
                 UPDATE todo_reminders
                 SET reminded_at = ?,
                     status = ?,
+                    deletion_reason = ?,
                     revision = revision + 1
                 WHERE id = ?
                   {user_sql}
@@ -1074,6 +1135,7 @@ class TodoStore:
         from_status: str,
         to_status: str,
         user_id: str | None = None,
+        deletion_reason: str | None = None,
     ) -> TodoReminder | None:
         """在指定原状态匹配时切换待办状态。
 
@@ -1088,7 +1150,7 @@ class TodoStore:
 
         with self._connect() as conn:
             user_sql = ""
-            params: list[Any] = [to_status, int(todo_id)]
+            params: list[Any] = [to_status, deletion_reason, int(todo_id)]
             if user_id is not None:
                 user_sql = "AND user_id = ?"
                 params.append(user_id)
@@ -1096,7 +1158,9 @@ class TodoStore:
             cursor = conn.execute(
                 f"""
                 UPDATE todo_reminders
-                SET status = ?, revision = revision + 1
+                SET status = ?,
+                    deletion_reason = ?,
+                    revision = revision + 1
                 WHERE id = ?
                   {user_sql}
                   AND status = ?
@@ -1210,6 +1274,8 @@ class TodoStore:
             conn.execute(
                 "ALTER TABLE todo_reminders ADD COLUMN revision INTEGER NOT NULL DEFAULT 1"
             )
+        if "deletion_reason" not in columns:
+            conn.execute("ALTER TABLE todo_reminders ADD COLUMN deletion_reason TEXT")
         if "content" not in columns:
             conn.execute("ALTER TABLE todo_reminders ADD COLUMN content TEXT")
         if "due_at" not in columns:
@@ -1221,6 +1287,18 @@ class TodoStore:
         self._backfill_todo_no(conn)
         self._backfill_history_ids(conn)
         conn.execute("UPDATE todo_reminders SET revision = 1 WHERE revision IS NULL OR revision < 1")
+        conn.execute(
+            """
+            UPDATE todo_reminders
+            SET deletion_reason = CASE
+                WHEN reminded_at IS NOT NULL THEN ?
+                WHEN status = ? THEN ?
+                ELSE NULL
+            END
+            WHERE deletion_reason IS NULL
+            """,
+            (DELETION_REASON_REMINDER_SENT, STATUS_DELETED, DELETION_REASON_USER_CANCEL),
+        )
         self._ensure_remind_at_nullable(conn)
 
     @staticmethod
@@ -1312,6 +1390,7 @@ class TodoStore:
                 status TEXT NOT NULL DEFAULT 'open',
                 created_at INTEGER NOT NULL,
                 reminded_at INTEGER,
+                deletion_reason TEXT,
                 llm_json TEXT
             );
 
@@ -1332,6 +1411,7 @@ class TodoStore:
                 status,
                 created_at,
                 reminded_at,
+                deletion_reason,
                 llm_json
             )
             SELECT
@@ -1351,6 +1431,7 @@ class TodoStore:
                 status,
                 created_at,
                 reminded_at,
+                deletion_reason,
                 llm_json
             FROM todo_reminders;
 
@@ -1638,6 +1719,7 @@ def _row_to_todo(row: sqlite3.Row) -> TodoReminder:
         status=str(row["status"]),
         created_at=int(row["created_at"]),
         reminded_at=_optional_int(row["reminded_at"]),
+        deletion_reason=row["deletion_reason"],
         llm_json=row["llm_json"],
     )
 

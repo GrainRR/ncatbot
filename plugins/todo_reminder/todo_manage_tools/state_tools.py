@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any, Callable
 
 from ..todo_store import (
+    ReminderReconfigurationRequiredError,
     ReminderTimeValidationError,
     STATUS_DELETED,
     STATUS_DONE,
@@ -24,6 +25,7 @@ from .common import (
     numbers_from_args,
     numbers_schema,
     object_schema,
+    parse_optional_time,
     resolve_todo,
     status_changed_result,
     target_schema,
@@ -108,11 +110,18 @@ def restore_todos(
     """
 
     history_ids = _history_ids_from_args(args)
+    new_remind_at = parse_optional_time(args.get("reminder_at"), "reminder_at", context)
     items = [_resolve_history_todo(store, context, value, (STATUS_DONE, STATUS_DELETED), "恢复") for value in history_ids]
     try:
         restored = store.restore_many(
-            [item.id for item in items], context.user_id, context.now, context.reject_past_reminder
+            [item.id for item in items],
+            context.user_id,
+            context.now,
+            context.reject_past_reminder,
+            new_remind_at,
         )
+    except ReminderReconfigurationRequiredError as exc:
+        return _restore_reminder_required_error(exc)
     except ReminderTimeValidationError as exc:
         return _reminder_error(exc)
     if restored is None:
@@ -244,6 +253,17 @@ def _reminder_error(exc: ReminderTimeValidationError) -> ToolResult:
     )
 
 
+def _restore_reminder_required_error(exc: ReminderReconfigurationRequiredError) -> ToolResult:
+    """提示已发送提醒的记录必须提供新的未来提醒时间。"""
+
+    return ToolResult(
+        False,
+        "clarify",
+        "该待办已发送过提醒；恢复前请重新设置未来提醒时间",
+        {"code": "future_remind_at_required", "history_ids": list(exc.history_ids)},
+    )
+
+
 def _confirmation_error(exc: TodoConfirmationError) -> ToolResult:
     """把确认令牌失败转换为不写库的结构化错误。"""
 
@@ -263,6 +283,7 @@ def _history_targets_schema() -> dict[str, Any]:
         {
             "history_ids": {"type": "array", "items": {"type": "string", "minLength": 1}, "minItems": 1},
             "history_id": {"type": ["string", "null"], "minLength": 1},
+            "reminder_at": {"type": ["string", "null"]},
         },
         required=[],
     )
@@ -295,7 +316,7 @@ def build_tool_specs(
         ),
         "restore_todos": ToolSpec(
             "restore_todos",
-            "恢复一个或多个已完成或已取消待办，必须使用稳定 history_id。",
+            "恢复一个或多个已完成或已取消待办，必须使用稳定 history_id；已发送提醒的记录必须提供新的未来 reminder_at。",
             _history_targets_schema(),
             handlers["restore_todos"],
         ),

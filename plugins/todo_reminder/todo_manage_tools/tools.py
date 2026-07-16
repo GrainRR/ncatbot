@@ -12,6 +12,7 @@ from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 from ..todo_store import (
+    ReminderReconfigurationRequiredError,
     ReminderTimeValidationError,
     STATUS_DELETED,
     STATUS_DONE,
@@ -511,6 +512,7 @@ class TodoToolExecutor:
         """
 
         history_ids = self._history_ids_from_args(args)
+        new_remind_at = self._parse_optional_time(args.get("reminder_at"), "reminder_at")
         items = [
             self._resolve_history_todo(history_id, (STATUS_DONE, STATUS_DELETED), "恢复")
             for history_id in history_ids
@@ -521,7 +523,10 @@ class TodoToolExecutor:
                 self.context.user_id,
                 self.context.now,
                 self.context.reject_past_reminder,
+                new_remind_at,
             )
+        except ReminderReconfigurationRequiredError as exc:
+            return self._restore_reminder_required_error(exc)
         except ReminderTimeValidationError as exc:
             return self._reminder_validation_error(exc)
         if restored is None:
@@ -852,6 +857,17 @@ class TodoToolExecutor:
         )
 
     @staticmethod
+    def _restore_reminder_required_error(exc: ReminderReconfigurationRequiredError) -> ToolResult:
+        """提示已发送提醒的待办必须配置新的未来提醒时间才能恢复。"""
+
+        return ToolResult(
+            ok=False,
+            status="clarify",
+            message="该待办已发送过提醒；恢复前请重新设置未来提醒时间",
+            data={"code": "future_remind_at_required", "history_ids": list(exc.history_ids)},
+        )
+
+    @staticmethod
     def _confirmation_error(exc: TodoConfirmationError) -> ToolResult:
         """返回不泄露内部数据库信息的永久删除确认失败结果。"""
 
@@ -1164,7 +1180,7 @@ def _build_tool_specs(executor: TodoToolExecutor) -> dict[str, ToolSpec]:
         ),
         "restore_todos": ToolSpec(
             "restore_todos",
-            "恢复一个或多个已完成或已取消待办。必须传列表中显示的稳定 history_id，不能使用待办序号。",
+            "恢复一个或多个已完成或已取消待办。必须传列表中显示的稳定 history_id；已发送提醒的记录必须同时提供新的未来 reminder_at。",
             _history_targets_schema(),
             executor.restore_todos,
         ),
@@ -1247,6 +1263,7 @@ def _history_targets_schema() -> dict[str, Any]:
                 "minItems": 1,
             },
             "history_id": {"type": ["string", "null"], "minLength": 1},
+            "reminder_at": {"type": ["string", "null"]},
         },
         required=[],
     )

@@ -6,6 +6,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -16,6 +17,9 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from plugins.todo_reminder.todo_manage_tools.tools import TodoToolContext, TodoToolExecutor
 from plugins.todo_reminder.todo_store import (
+    DELETION_REASON_REMINDER_SENT,
+    DELETION_REASON_USER_CANCEL,
+    STATUS_DELETED,
     ReminderTimeValidationError,
     STATUS_DONE,
     STATUS_OPEN,
@@ -225,6 +229,39 @@ class TodoReminderGuardsTests(unittest.TestCase):
         restored = self.executor.execute("restore_todos", {"history_id": old.history_id})
         self.assertEqual("remind_at_not_future", restored.data["code"])
         self.assertEqual(STATUS_DONE, self.store.find_by_history_id("owner", old.history_id).status)
+
+    def test_restore_sent_reminder_requires_and_uses_a_new_future_time(self) -> None:
+        sent = self._create("sent reminder")[0]
+        self.store.mark_reminded(sent.id, NOW, "owner")
+        deleted = self.store.find_by_history_id("owner", sent.history_id)
+        self.assertEqual(DELETION_REASON_REMINDER_SENT, deleted.deletion_reason)
+
+        missing_time = self.executor.execute("restore_todos", {"history_id": sent.history_id})
+        self.assertEqual("future_remind_at_required", missing_time.data["code"])
+        self.assertEqual(STATUS_DELETED, self.store.find_by_history_id("owner", sent.history_id).status)
+
+        new_remind_at = NOW + 7_200
+        new_time_text = datetime.fromtimestamp(
+            new_remind_at, ZoneInfo("Asia/Shanghai")
+        ).strftime("%Y-%m-%d %H:%M:%S")
+        restored = self.executor.execute(
+            "restore_todos",
+            {"history_id": sent.history_id, "reminder_at": new_time_text},
+        )
+        self.assertTrue(restored.ok)
+        restored_item = self.store.find_by_history_id("owner", sent.history_id)
+        self.assertEqual(STATUS_OPEN, restored_item.status)
+        self.assertEqual(new_remind_at, restored_item.remind_at)
+        self.assertIsNone(restored_item.reminded_at)
+        self.assertIsNone(restored_item.deletion_reason)
+        self.assertNotIn(sent.history_id, [item.history_id for item in self.store.due_pending(NOW + 1)])
+
+        canceled = self._create("user cancelled")[0]
+        self.store.cancel(canceled.id, "owner")
+        self.assertEqual(
+            DELETION_REASON_USER_CANCEL,
+            self.store.find_by_history_id("owner", canceled.history_id).deletion_reason,
+        )
 
 
 if __name__ == "__main__":
