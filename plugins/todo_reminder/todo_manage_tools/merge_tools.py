@@ -1,118 +1,76 @@
-"""Todo 合并用途工具。"""
+"""合并工具：merge_todos。"""
 
 from __future__ import annotations
 
-from typing import Any, Callable
+from typing import Any
 
-from ..todo_store import ReminderTimeValidationError, STATUS_OPEN, TodoStore
-from .common import (
-    TodoToolContext,
-    ToolResult,
-    ToolSpec,
-    clean_optional_text,
-    format_inline,
-    numbers_from_args,
-    object_schema,
-    resolve_todo,
-    status_changed_result,
-    todo_to_dict,
-)
+from .contracts import ToolExecutionStop, ToolResult, ToolRuntime, ToolSpec
+from .presentation import format_inline, todo_to_dict
+from .targets import batch_state_changed_result, numbers_from_args, resolve_open_todo
+from .validation import clean_optional_text, object_schema
 
 
-def merge_todos(
-    store: TodoStore,
-    context: TodoToolContext,
-    args: dict[str, Any],
-) -> ToolResult:
-    """合并多条未完成待办。
-
-    Args:
-        store: Todo 存储层实例。
-        context: 程序路由层生成的可信执行上下文。
-        args: 已通过 schema 校验的工具参数，包含至少两个用户可见编号
-            和可选合并后标题。
-
-    Returns:
-        合并后的待办；编号不足或状态非法时返回澄清或错误结果。
-    """
-
-    numbers = numbers_from_args(args, context)
-    if len(numbers) < 2:
-        return ToolResult(
-            ok=False,
-            status="clarify",
-            message="合并待办至少需要两个编号",
-            data={"numbers": numbers},
-        )
-    items = [resolve_todo(store, context, number, (STATUS_OPEN,), "合并") for number in numbers]
-    title = clean_optional_text(args.get("title")) or "；".join(item.title for item in items)
-    content_parts = [item.content or item.title for item in items]
-    remind_values = [item.remind_at for item in items if item.remind_at is not None]
-    due_values = [item.due_at for item in items if item.due_at is not None]
-    updates = {
-        "title": title,
-        "content": "\n".join(content_parts),
-        "raw_text": context.user_text or "合并待办",
-        "reminder_text": "",
-        "remind_at": min(remind_values) if remind_values else None,
-        "due_at": max(due_values) if due_values else None,
-    }
-    try:
-        merged = store.merge_open_todos(
-            [item.id for item in items],
-            context.user_id,
-            updates,
-            context.now,
-            context.reject_past_reminder,
-        )
-    except ReminderTimeValidationError as exc:
-        return ToolResult(
-            ok=False,
-            status="error",
-            message="提醒时间必须晚于当前时间，待办没有写入",
-            data={"code": "remind_at_not_future", "remind_at": exc.remind_at, "now": exc.now},
-        )
-    if merged is None:
-        return ToolResult(
-            ok=False,
-            status="error",
-            message="待办状态或归属已变化，批量合并未执行，数据没有部分修改",
-            data={"numbers": numbers, "atomic": True},
-        )
-    return ToolResult(
-        ok=True,
-        status="success",
-        message=f"已合并为待办：{format_inline(merged)}",
-        data={
-            "item": todo_to_dict(merged, context.timezone),
-            "merged_numbers": numbers,
-        },
-    )
+__all__ = ["tool_specs"]
 
 
-def build_tool_specs(
-    handlers: dict[str, Callable[[dict[str, Any]], ToolResult]],
-) -> dict[str, ToolSpec]:
-    """构建合并用途工具定义。
+def tool_specs() -> tuple[ToolSpec, ...]:
+    """返回合并工具定义。"""
 
-    Args:
-        handlers: 以工具名为键的后端执行函数映射。
-
-    Returns:
-        合并工具的 ToolSpec 映射。
-    """
-
-    return {
-        "merge_todos": ToolSpec(
+    return (
+        ToolSpec(
             "merge_todos",
             "合并多个未完成待办，保留第一个编号并取消其余编号。",
             object_schema(
                 {
-                    "numbers": {"type": "array", "items": {"type": "integer", "minimum": 1}, "minItems": 2},
+                    "numbers": {
+                        "type": "array",
+                        "items": {"type": "integer", "minimum": 1},
+                        "minItems": 2,
+                    },
                     "title": {"type": ["string", "null"]},
                 },
                 required=["numbers"],
             ),
-            handlers["merge_todos"],
+            _merge_todos,
+        ),
+    )
+
+
+def _merge_todos(runtime: ToolRuntime, args: dict[str, Any]) -> ToolResult:
+    numbers = numbers_from_args(args, runtime)
+    if len(numbers) < 2:
+        raise ToolExecutionStop(ToolResult(False, "clarify", "合并待办至少需要两个编号", {"numbers": numbers}))
+    items = [resolve_open_todo(runtime, number, "合并") for number in numbers]
+    title = clean_optional_text(args.get("title")) or "；".join(item.title for item in items)
+    updates = {
+        "title": title,
+        "content": "\n".join(item.content or item.title for item in items),
+        "raw_text": runtime.context.user_text or "合并待办",
+        "reminder_text": "",
+        "remind_at": min(
+            (item.remind_at for item in items if item.remind_at is not None),
+            default=None,
+        ),
+        "due_at": max(
+            (item.due_at for item in items if item.due_at is not None),
+            default=None,
         ),
     }
+    merged = runtime.store.merge_open_todos(
+        [item.id for item in items],
+        runtime.context.user_id,
+        updates,
+        runtime.context.now,
+        runtime.context.reject_past_reminder,
+    )
+    if merged is None:
+        return batch_state_changed_result("合并", "numbers", numbers)
+    return ToolResult(
+        True,
+        "success",
+        f"已合并为待办：{format_inline(merged)}",
+        {
+            "item": todo_to_dict(merged, runtime.context.timezone),
+            "merged_numbers": numbers,
+        },
+    )

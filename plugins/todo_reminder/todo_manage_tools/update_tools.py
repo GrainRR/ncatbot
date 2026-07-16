@@ -1,175 +1,30 @@
-"""Todo 修改用途工具。"""
+"""修改工具：edit_todo、shift_todo_time。"""
 
 from __future__ import annotations
 
-from typing import Any, Callable
+from typing import Any
 
-from ..todo_store import STATUS_OPEN, TodoStore
-from .common import (
-    TodoToolContext,
-    ToolResult,
-    ToolSpec,
+from ..todo_store import STATUS_OPEN, TodoReminder
+from .contracts import ToolExecutionStop, ToolResult, ToolRuntime, ToolSpec
+from .presentation import format_inline, todo_to_dict
+from .targets import number_from_args, resolve_open_todo
+from .validation import (
     clean_optional_text,
     clean_required_text,
-    format_inline,
-    number_from_args,
     object_schema,
     parse_optional_time,
-    resolve_todo,
-    shift_fields,
-    status_changed_result,
-    time_field_label,
-    todo_to_dict,
+    target_schema,
 )
 
 
-def edit_todo(
-    store: TodoStore,
-    context: TodoToolContext,
-    args: dict[str, Any],
-) -> ToolResult:
-    """修改一条未完成待办的可编辑字段。
-
-    Args:
-        store: Todo 存储层实例。
-        context: 程序路由层生成的可信执行上下文。
-        args: 已通过 schema 校验的工具参数，包含目标编号和要更新的
-            标题、内容、时间或提醒文案。
-
-    Returns:
-        修改后的待办；没有可更新字段时返回澄清结果。
-    """
-
-    number = number_from_args(args, context)
-    item = resolve_todo(store, context, number, (STATUS_OPEN,), "修改")
-    updates: dict[str, Any] = {}
-
-    if "title" in args and args.get("title") is not None:
-        updates["title"] = clean_required_text(args.get("title"), "title")
-    if "content" in args:
-        updates["content"] = clean_optional_text(args.get("content"))
-    if args.get("clear_reminder_at") is True:
-        updates["remind_at"] = None
-    elif "reminder_at" in args and args.get("reminder_at") is not None:
-        updates["remind_at"] = parse_optional_time(args.get("reminder_at"), "reminder_at", context)
-    if args.get("clear_due_at") is True:
-        updates["due_at"] = None
-    elif "due_at" in args and args.get("due_at") is not None:
-        updates["due_at"] = parse_optional_time(args.get("due_at"), "due_at", context)
-    if "reminder_text" in args and args.get("reminder_text") is not None:
-        updates["reminder_text"] = clean_required_text(args.get("reminder_text"), "reminder_text")
-
-    if not updates:
-        return ToolResult(
-            ok=False,
-            status="clarify",
-            message="需要补充要修改的标题、内容或时间",
-            data={"number": number},
-        )
-
-    updated = store.update_fields(
-        item.id,
-        updates,
-        STATUS_OPEN,
-        context.user_id,
-        context.now,
-        context.reject_past_reminder,
-    )
-    if updated is None:
-        return status_changed_result(store, context, number, "修改")
-    return ToolResult(
-        ok=True,
-        status="success",
-        message=f"已修改待办：{format_inline(updated)}",
-        data={"item": todo_to_dict(updated, context.timezone)},
-    )
+__all__ = ["tool_specs"]
 
 
-def shift_todo_time(
-    store: TodoStore,
-    context: TodoToolContext,
-    args: dict[str, Any],
-) -> ToolResult:
-    """按分钟提前或推迟待办时间。
+def tool_specs() -> tuple[ToolSpec, ...]:
+    """返回修改工具定义。"""
 
-    Args:
-        store: Todo 存储层实例。
-        context: 程序路由层生成的可信执行上下文。
-        args: 已通过 schema 校验的工具参数，包含目标编号、时间字段、
-            调整方向和正整数分钟数。
-
-    Returns:
-        更新后的待办；字段不明确或目标没有时间字段时返回澄清结果。
-    """
-
-    number = number_from_args(args, context)
-    item = resolve_todo(store, context, number, (STATUS_OPEN,), "调整时间")
-    field = args["field"]
-    direction = args["direction"]
-    delta_minutes = args["delta_minutes"]
-    delta_seconds = int(delta_minutes) * 60
-    if direction == "earlier":
-        delta_seconds *= -1
-
-    fields = shift_fields(item, field)
-    updates: dict[str, Any] = {}
-    for field_name in fields:
-        current_value = item.remind_at if field_name == "reminder_at" else item.due_at
-        if current_value is None:
-            continue
-        store_field = "remind_at" if field_name == "reminder_at" else "due_at"
-        updates[store_field] = current_value + delta_seconds
-
-    if not updates:
-        return ToolResult(
-            ok=False,
-            status="clarify",
-            message="这条待办没有任何时间字段，需要用户补充要调整哪个时间",
-            data={"number": number},
-        )
-
-    updated = store.update_fields(
-        item.id,
-        updates,
-        STATUS_OPEN,
-        context.user_id,
-        context.now,
-        context.reject_past_reminder,
-    )
-    if updated is None:
-        return status_changed_result(store, context, number, "调整时间")
-    direction_text = "提前" if direction == "earlier" else "推迟"
-    field_text = "、".join(time_field_label(field_name) for field_name in fields)
-    return ToolResult(
-        ok=True,
-        status="success",
-        message=(
-            f"已将第 {updated.todo_no} 条待办的{field_text}{direction_text} {delta_minutes} 分钟："
-            f"{format_inline(updated)}"
-        ),
-        data={
-            "item": todo_to_dict(updated, context.timezone),
-            "shifted_fields": fields,
-            "delta_minutes": delta_minutes,
-            "direction": direction,
-        },
-    )
-
-
-def build_tool_specs(
-    handlers: dict[str, Callable[[dict[str, Any]], ToolResult]],
-) -> dict[str, ToolSpec]:
-    """构建修改用途工具定义。
-
-    Args:
-        handlers: 以工具名为键的后端执行函数映射。
-
-    Returns:
-        修改工具的 ToolSpec 映射。
-    """
-
-    return {
-        "edit_todo": ToolSpec(
+    return (
+        ToolSpec(
             "edit_todo",
             "修改一条未完成待办的标题、内容、提醒时间或截止时间。",
             object_schema(
@@ -186,11 +41,11 @@ def build_tool_specs(
                 },
                 required=[],
             ),
-            handlers["edit_todo"],
+            _edit_todo,
         ),
-        "shift_todo_time": ToolSpec(
+        ToolSpec(
             "shift_todo_time",
-            "把一条待办的提醒时间、截止时间或两者按分钟提前或推迟。时间计算只能由后端执行。",
+            "把未完成待办的提醒时间、截止时间或两者按分钟提前或推迟。",
             object_schema(
                 {
                     "number": {"type": ["integer", "null"], "minimum": 1},
@@ -201,6 +56,122 @@ def build_tool_specs(
                 },
                 required=["field", "direction", "delta_minutes"],
             ),
-            handlers["shift_todo_time"],
+            _shift_todo_time,
         ),
-    }
+    )
+
+
+def _edit_todo(runtime: ToolRuntime, args: dict[str, Any]) -> ToolResult:
+    context = runtime.context
+    number = number_from_args(args, runtime)
+    item = resolve_open_todo(runtime, number, "修改")
+    updates: dict[str, Any] = {}
+    if args.get("title") is not None:
+        updates["title"] = clean_required_text(args["title"], "title")
+    if "content" in args:
+        updates["content"] = clean_optional_text(args.get("content"))
+    if args.get("clear_reminder_at") is True:
+        updates["remind_at"] = None
+    elif args.get("reminder_at") is not None:
+        updates["remind_at"] = parse_optional_time(args["reminder_at"], "reminder_at", context)
+    if args.get("clear_due_at") is True:
+        updates["due_at"] = None
+    elif args.get("due_at") is not None:
+        updates["due_at"] = parse_optional_time(args["due_at"], "due_at", context)
+    if args.get("reminder_text") is not None:
+        updates["reminder_text"] = clean_required_text(args["reminder_text"], "reminder_text")
+    if not updates:
+        raise ToolExecutionStop(
+            ToolResult(False, "clarify", "需要补充要修改的标题、内容或时间", {"number": number})
+        )
+    updated = runtime.store.update_fields(
+        item.id,
+        updates,
+        STATUS_OPEN,
+        context.user_id,
+        context.now,
+        context.reject_past_reminder,
+    )
+    if updated is None:
+        return _status_changed_result(runtime, number, "修改")
+    return ToolResult(True, "success", f"已修改待办：{format_inline(updated)}", {"item": todo_to_dict(updated, context.timezone)})
+
+
+def _shift_todo_time(runtime: ToolRuntime, args: dict[str, Any]) -> ToolResult:
+    context = runtime.context
+    number = number_from_args(args, runtime)
+    item = resolve_open_todo(runtime, number, "调整时间")
+    fields = _shift_fields(item, args["field"])
+    delta_seconds = int(args["delta_minutes"]) * 60
+    if args["direction"] == "earlier":
+        delta_seconds *= -1
+    updates: dict[str, int] = {}
+    for field_name in fields:
+        current_value = item.remind_at if field_name == "reminder_at" else item.due_at
+        if current_value is not None:
+            updates["remind_at" if field_name == "reminder_at" else "due_at"] = current_value + delta_seconds
+    if not updates:
+        raise ToolExecutionStop(
+            ToolResult(False, "clarify", "这条待办没有任何时间字段，需要用户补充要调整哪个时间", {"number": number})
+        )
+    updated = runtime.store.update_fields(
+        item.id,
+        updates,
+        STATUS_OPEN,
+        context.user_id,
+        context.now,
+        context.reject_past_reminder,
+    )
+    if updated is None:
+        return _status_changed_result(runtime, number, "调整时间")
+    direction_text = "提前" if args["direction"] == "earlier" else "推迟"
+    field_text = "、".join("提醒时间" if value == "reminder_at" else "截止时间" for value in fields)
+    return ToolResult(
+        True,
+        "success",
+        f"已将第 {updated.todo_no} 条待办的{field_text}{direction_text} {args['delta_minutes']} 分钟：{format_inline(updated)}",
+        {
+            "item": todo_to_dict(updated, context.timezone),
+            "shifted_fields": fields,
+            "delta_minutes": args["delta_minutes"],
+            "direction": args["direction"],
+        },
+    )
+
+
+def _shift_fields(item: TodoReminder, field: str) -> list[str]:
+    if field == "both":
+        if item.remind_at is None and item.due_at is None:
+            raise _missing_time_field(item)
+        return ["reminder_at", "due_at"]
+    if field == "reminder_at":
+        if item.remind_at is None:
+            raise ToolExecutionStop(ToolResult(False, "clarify", "这条待办没有提醒时间，需要用户补充新的提醒时间", {"number": item.todo_no}))
+        return ["reminder_at"]
+    if field == "due_at":
+        if item.due_at is None:
+            raise ToolExecutionStop(ToolResult(False, "clarify", "这条待办没有截止时间，需要用户补充新的截止时间", {"number": item.todo_no}))
+        return ["due_at"]
+    has_reminder = item.remind_at is not None
+    has_due = item.due_at is not None
+    if not has_reminder and not has_due:
+        raise _missing_time_field(item)
+    if has_reminder and has_due:
+        raise ToolExecutionStop(
+            ToolResult(False, "clarify", "这条待办同时有提醒时间和截止时间，请说明要调整哪一个", {"number": item.todo_no})
+        )
+    return ["reminder_at"] if has_reminder else ["due_at"]
+
+
+def _missing_time_field(item: TodoReminder) -> ToolExecutionStop:
+    return ToolExecutionStop(
+        ToolResult(False, "clarify", "这条待办没有任何时间字段，需要用户补充要调整哪个时间", {"number": item.todo_no})
+    )
+
+
+def _status_changed_result(runtime: ToolRuntime, number: int, action: str) -> ToolResult:
+    context = runtime.context
+    existing = runtime.store.find_by_no(context.scope, context.group_id, context.user_id, number, None)
+    if existing is not None:
+        return ToolResult(False, "error", f"第 {number} 条待办当前状态已变化，不能{action}", {"number": number, "status": existing.status})
+    return ToolResult(False, "error", f"找不到第 {number} 条待办，请先查看待办列表确认编号", {"number": number})
