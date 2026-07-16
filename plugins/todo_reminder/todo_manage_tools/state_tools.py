@@ -4,11 +4,21 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
-from ..todo_store import STATUS_DELETED, STATUS_DONE, STATUS_OPEN, TodoReminder, TodoStore
+from ..todo_store import (
+    ReminderTimeValidationError,
+    STATUS_DELETED,
+    STATUS_DONE,
+    STATUS_OPEN,
+    TodoConfirmationError,
+    TodoReminder,
+    TodoStore,
+)
 from .common import (
     TodoToolContext,
     ToolResult,
     ToolSpec,
+    ToolExecutionStop,
+    clean_optional_text,
     format_inline,
     number_from_args,
     numbers_from_args,
@@ -40,12 +50,9 @@ def complete_todos(
 
     numbers = numbers_from_args(args, context)
     items = [resolve_todo(store, context, number, (STATUS_OPEN,), "完成") for number in numbers]
-    completed: list[TodoReminder] = []
-    for item in items:
-        updated = store.complete(item.id)
-        if updated is None:
-            return status_changed_result(store, context, item.todo_no, "完成")
-        completed.append(updated)
+    completed = store.complete_many([item.id for item in items], context.user_id)
+    if completed is None:
+        return _atomic_failure("完成", "numbers", numbers)
     return ToolResult(
         ok=True,
         status="success",
@@ -72,7 +79,7 @@ def cancel_todo(
 
     number = number_from_args(args, context)
     item = resolve_todo(store, context, number, (STATUS_OPEN,), "取消")
-    canceled = store.cancel(item.id)
+    canceled = store.cancel(item.id, context.user_id)
     if canceled is None:
         return status_changed_result(store, context, number, "取消")
     return ToolResult(
@@ -100,17 +107,16 @@ def restore_todos(
         已恢复待办列表；目标不存在或状态非法时返回错误结果。
     """
 
-    numbers = numbers_from_args(args, context)
-    items = [
-        resolve_todo(store, context, number, (STATUS_DONE, STATUS_DELETED), "恢复")
-        for number in numbers
-    ]
-    restored: list[TodoReminder] = []
-    for item in items:
-        updated = store.restore(item.id)
-        if updated is None:
-            return status_changed_result(store, context, item.todo_no, "恢复")
-        restored.append(updated)
+    history_ids = _history_ids_from_args(args)
+    items = [_resolve_history_todo(store, context, value, (STATUS_DONE, STATUS_DELETED), "恢复") for value in history_ids]
+    try:
+        restored = store.restore_many(
+            [item.id for item in items], context.user_id, context.now, context.reject_past_reminder
+        )
+    except ReminderTimeValidationError as exc:
+        return _reminder_error(exc)
+    if restored is None:
+        return _atomic_failure("恢复", "history_ids", history_ids)
     return ToolResult(
         ok=True,
         status="success",
@@ -135,25 +141,130 @@ def delete_todos(
         未确认时返回确认结果且不删库；确认后返回永久删除结果。
     """
 
-    numbers = numbers_from_args(args, context)
-    items = [resolve_todo(store, context, number, None, "永久删除") for number in numbers]
-    if args.get("confirmed") is not True:
+    history_ids = _history_ids_from_args(args)
+    token = clean_optional_text(args.get("confirmation_token"))
+    if token is None:
+        items = [_resolve_history_todo(store, context, value, None, "永久删除") for value in history_ids]
+        confirmation = store.create_permanent_delete_confirmation(
+            context.user_id,
+            items,
+            context.now,
+            context.permanent_delete_confirmation_ttl_seconds,
+        )
         return ToolResult(
             ok=False,
             status="confirm",
             message=(
-                "永久删除不可恢复。请确认是否永久删除："
+                "永久删除不可恢复。请在令牌有效期内使用此确认令牌再次确认："
+                f"{confirmation.token}\n目标："
                 + "、".join(format_inline(item) for item in items)
             ),
-            data={"items": [todo_to_dict(item, context.timezone) for item in items], "deleted": False},
+            data={
+                "items": [todo_to_dict(item, context.timezone) for item in items],
+                "deleted": False,
+                "confirmation_token": confirmation.token,
+                "expires_at": confirmation.expires_at,
+                "history_ids": list(confirmation.target_history_ids),
+            },
         )
-    for item in items:
-        store.delete_permanent(item.id)
+    try:
+        deleted = store.permanently_delete_confirmed(token, context.user_id, history_ids, context.now)
+    except TodoConfirmationError as exc:
+        return _confirmation_error(exc)
     return ToolResult(
         ok=True,
         status="success",
-        message="已永久删除待办：" + "、".join(f"[{item.todo_no}] {item.title}" for item in items),
-        data={"items": [todo_to_dict(item, context.timezone) for item in items], "deleted": True},
+        message="已永久删除待办：" + "、".join(format_inline(item) for item in deleted),
+        data={"items": [todo_to_dict(item, context.timezone) for item in deleted], "deleted": True},
+    )
+
+
+def _history_ids_from_args(args: dict[str, Any]) -> list[str]:
+    """从参数中读取一个或多个稳定历史 ID。"""
+
+    values = args.get("history_ids")
+    if values:
+        history_ids = list(dict.fromkeys(str(value).strip() for value in values if str(value).strip()))
+        if history_ids:
+            return history_ids
+    history_id = clean_optional_text(args.get("history_id"))
+    if history_id:
+        return [history_id]
+    raise ToolExecutionStop(
+        ToolResult(False, "clarify", "请提供待办列表中显示的历史 ID（例如 H-...）", {})
+    )
+
+
+def _resolve_history_todo(
+    store: TodoStore,
+    context: TodoToolContext,
+    history_id: str,
+    statuses: tuple[str, ...] | None,
+    action: str,
+) -> TodoReminder:
+    """按稳定历史 ID 查找目标，禁止按可复用序号猜测历史记录。"""
+
+    item = store.find_by_history_id(context.user_id, history_id, statuses)
+    if item is not None:
+        return item
+    existing = store.find_by_history_id(context.user_id, history_id, None)
+    if existing is not None:
+        raise ToolExecutionStop(
+            ToolResult(
+                False,
+                "error",
+                f"历史 ID {history_id} 的待办当前状态不允许{action}",
+                {"history_id": history_id, "status": existing.status},
+            )
+        )
+    raise ToolExecutionStop(
+        ToolResult(False, "error", f"找不到历史 ID {history_id} 对应的待办", {"history_id": history_id})
+    )
+
+
+def _atomic_failure(action: str, target_field: str, targets: list[Any]) -> ToolResult:
+    """表示事务内复核失败且没有部分写入。"""
+
+    return ToolResult(
+        False,
+        "error",
+        f"待办状态或归属已变化，批量{action}未执行，数据没有部分修改",
+        {target_field: targets, "atomic": True},
+    )
+
+
+def _reminder_error(exc: ReminderTimeValidationError) -> ToolResult:
+    """把统一提醒时间校验异常转换为结构化工具错误。"""
+
+    return ToolResult(
+        False,
+        "error",
+        "提醒时间必须晚于当前时间，待办没有写入",
+        {"code": "remind_at_not_future", "remind_at": exc.remind_at, "now": exc.now},
+    )
+
+
+def _confirmation_error(exc: TodoConfirmationError) -> ToolResult:
+    """把确认令牌失败转换为不写库的结构化错误。"""
+
+    messages = {
+        "confirmation_invalid": "永久删除确认令牌无效，待办没有删除",
+        "confirmation_expired": "永久删除确认令牌已过期，待办没有删除",
+        "confirmation_target_mismatch": "确认目标与首次请求不一致，待办没有删除",
+        "confirmation_target_changed": "确认期间待办状态已变化，待办没有删除",
+    }
+    return ToolResult(False, "error", messages.get(exc.code, "永久删除确认失败，待办没有删除"), {"code": exc.code, **exc.data})
+
+
+def _history_targets_schema() -> dict[str, Any]:
+    """构建仅允许稳定历史 ID 的目标参数 schema。"""
+
+    return object_schema(
+        {
+            "history_ids": {"type": "array", "items": {"type": "string", "minLength": 1}, "minItems": 1},
+            "history_id": {"type": ["string", "null"], "minLength": 1},
+        },
+        required=[],
     )
 
 
@@ -184,18 +295,18 @@ def build_tool_specs(
         ),
         "restore_todos": ToolSpec(
             "restore_todos",
-            "恢复一个或多个已完成或已取消待办。",
-            numbers_schema(required=[]),
+            "恢复一个或多个已完成或已取消待办，必须使用稳定 history_id。",
+            _history_targets_schema(),
             handlers["restore_todos"],
         ),
         "delete_todos": ToolSpec(
             "delete_todos",
-            "永久删除一个或多个待办。默认必须确认，confirmed 不为 true 时不能执行删除。",
+            "永久删除一个或多个待办，必须使用稳定 history_id。首次调用只生成确认令牌，confirmed 会被忽略。",
             object_schema(
                 {
-                    "numbers": {"type": "array", "items": {"type": "integer", "minimum": 1}, "minItems": 1},
-                    "number": {"type": ["integer", "null"], "minimum": 1},
-                    "reference": {"type": ["string", "null"]},
+                    "history_ids": {"type": "array", "items": {"type": "string", "minLength": 1}, "minItems": 1},
+                    "history_id": {"type": ["string", "null"], "minLength": 1},
+                    "confirmation_token": {"type": ["string", "null"], "minLength": 1},
                     "confirmed": {"type": "boolean"},
                 },
                 required=[],

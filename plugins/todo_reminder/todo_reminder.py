@@ -10,7 +10,6 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from ncatbot.core import registrar
 from ncatbot.event.qq import GroupMessageEvent, PrivateMessageEvent
 from ncatbot.plugin import NcatBotPlugin
-from ncatbot.types import MessageArray
 
 from .llm import TodoToolLoop
 from .todo_manage_tools import TodoToolContext
@@ -113,6 +112,10 @@ _TODO_CREATE_PREFIXES = (
     "加个",
     "加一条",
 )
+_GROUP_TODO_TOGGLE_TEXTS = {
+    "#待办 开启": True,
+    "#待办 关闭": False,
+}
 
 
 class TodoReminderPlugin(NcatBotPlugin):
@@ -125,12 +128,19 @@ class TodoReminderPlugin(NcatBotPlugin):
 
     store: TodoStore
     tool_loop: TodoToolLoop
-    _last_todo_numbers: dict[tuple[str, str, str], int]
+    _last_todo_numbers: dict[str, int]
     _checking_due: bool
 
     async def on_load(self):
         """插件加载时初始化配置、数据库、LLM 解析器和定时扫描任务。"""
 
+        configured_max_pending = None
+        raw_config = getattr(self, "config", None)
+        if isinstance(raw_config, dict):
+            configured_max_pending = raw_config.get("max_pending_todos_per_user")
+            if configured_max_pending is None:
+                configured_max_pending = raw_config.get("max_pending_todos_per_scope")
+        self._configured_max_pending = configured_max_pending
         self.init_defaults(
             {
                 "llm_api_base": "",
@@ -142,9 +152,11 @@ class TodoReminderPlugin(NcatBotPlugin):
                 "timezone": "Asia/Shanghai",
                 "default_reminder_mode": MODE_CONCISE,
                 "reminder_check_interval": "60s",
+                "max_pending_todos_per_user": 100,
                 "max_pending_todos_per_scope": 100,
                 "max_due_reminders_per_check": 20,
                 "reject_past_reminder": True,
+                "permanent_delete_confirmation_ttl_seconds": 300,
             }
         )
         self.store = TodoStore(self.workspace / TODO_DB_FILENAME)
@@ -166,6 +178,15 @@ class TodoReminderPlugin(NcatBotPlugin):
             event: 收到的群消息事件。
         """
 
+        text = " ".join(_event_text(event).strip().split())
+        # 判断群聊待办功能启用状态
+        enabled = _GROUP_TODO_TOGGLE_TEXTS.get(text)
+        if enabled is not None:
+            await self._handle_group_todo_toggle(event, enabled)
+            return
+        store = getattr(self, "store", None)
+        if store is None or not store.is_group_todo_enabled(str(event.group_id)):
+            return
         await self._route_todo_message(event, *self._group_context(event))
 
     @registrar.qq.on_private_message()
@@ -188,7 +209,7 @@ class TodoReminderPlugin(NcatBotPlugin):
             依次返回范围类型、群号和用户 QQ 号。
         """
 
-        return SCOPE_GROUP, str(event.group_id), str(event.user_id)
+        return SCOPE_GROUP, str(event.group_id), _event_user_id(event)
 
     def _private_context(self, event: PrivateMessageEvent) -> tuple[str, str | None, str]:
         """生成私聊命令使用的待办范围参数。
@@ -200,7 +221,34 @@ class TodoReminderPlugin(NcatBotPlugin):
             依次返回范围类型、空群号和用户 QQ 号。
         """
 
-        return SCOPE_PRIVATE, None, str(event.user_id)
+        return SCOPE_PRIVATE, None, _event_user_id(event)
+
+    async def _handle_group_todo_toggle(self, event: GroupMessageEvent, enabled: bool) -> None:
+        """处理群待办开关，权限查询失败或权限不足时不写入配置。"""
+
+        permission = await self._group_manager_permission(event)
+        if permission is None:
+            await event.reply("无法查询群成员权限，群待办开关未修改")
+            return
+        if not permission:
+            await event.reply("只有群主和管理员可以切换群待办开关")
+            return
+        self.store.set_group_todo_enabled(str(event.group_id), enabled, self._now())
+        state = "开启" if enabled else "关闭"
+        await event.reply(f"群待办已{state}")
+
+    async def _group_manager_permission(self, event: GroupMessageEvent) -> bool | None:
+        """查询群主/管理员权限；查询失败返回 None。"""
+
+        try:
+            member_info = await self.api.qq.query.get_group_member_info(
+                group_id=event.group_id,
+                user_id=_event_user_id(event),
+            )
+        except Exception as exc:
+            self.logger.exception("查询群待办开关权限失败: %s", exc)
+            return None
+        return getattr(member_info, "role", None) in ("owner", "admin")
 
     async def _list_todos(
         self,
@@ -361,8 +409,11 @@ class TodoReminderPlugin(NcatBotPlugin):
             user_id=user_id,
             now=self._now(),
             timezone=self._timezone(),
-            max_pending=_positive_int(self.get_config("max_pending_todos_per_scope"), 100),
+            max_pending=self._max_pending_limit(),
             reject_past_reminder=bool(self.get_config("reject_past_reminder", True)),
+            permanent_delete_confirmation_ttl_seconds=_positive_int(
+                self.get_config("permanent_delete_confirmation_ttl_seconds"), 300
+            ),
             last_todo_no=self._last_todo_numbers.get(self._context_key(scope, group_id, user_id)),
             reminder_mode=self._reminder_mode(scope, group_id, user_id),
             user_text=user_text,
@@ -397,7 +448,7 @@ class TodoReminderPlugin(NcatBotPlugin):
                     self._last_todo_numbers[key] = int(item["number"])
 
     @staticmethod
-    def _context_key(scope: str, group_id: str | None, user_id: str) -> tuple[str, str, str]:
+    def _context_key(scope: str, group_id: str | None, user_id: str) -> str:
         """生成记录最近操作编号的上下文键。
 
         Args:
@@ -409,7 +460,7 @@ class TodoReminderPlugin(NcatBotPlugin):
             可作为字典键使用的稳定三元组。
         """
 
-        return scope, group_id or "", user_id
+        return str(user_id)
 
     async def check_due_todos(self) -> None:
         """定时扫描到期待办，并按来源发送群聊或私聊提醒。
@@ -429,7 +480,7 @@ class TodoReminderPlugin(NcatBotPlugin):
                 try:
                     await self._send_reminder(item)
                     # 只有发送成功后才标记并自动软删除，避免发送失败后丢提醒。
-                    self.store.mark_reminded(item.id, self._now())
+                    self.store.mark_reminded(item.id, self._now(), item.user_id)
                     self.logger.info(
                         "待办提醒已发送并自动删除: id=%s todo_no=%s scope=%s group_id=%s user_id=%s",
                         item.id,
@@ -443,7 +494,7 @@ class TodoReminderPlugin(NcatBotPlugin):
         finally:
             self._checking_due = False
 
-    async def _send_reminder(self, item: TodoReminder) -> None:
+    async def _send_reminder(self, item: TodoReminder) -> bool:
         """发送单条到期待办提醒。
 
         Args:
@@ -452,11 +503,8 @@ class TodoReminderPlugin(NcatBotPlugin):
 
         text = item.reminder_text or f"待办提醒：{item.title}"
 
-        if item.scope == SCOPE_GROUP and item.group_id:
-            message = MessageArray().add_at(item.user_id).add_text(f" {text}")
-            await self.api.qq.post_group_array_msg(item.group_id, message)
-            return
         await self.api.qq.send_private_text(item.user_id, text)
+        return True
 
     def _reminder_mode(self, scope: str, group_id: str | None, user_id: str) -> str:
         """获取当前提醒展示风格。
@@ -475,6 +523,16 @@ class TodoReminderPlugin(NcatBotPlugin):
             configured = str(self.get_config("default_reminder_mode", MODE_CONCISE) or MODE_CONCISE)
             return configured if configured in {MODE_CONCISE, MODE_CATGIRL} else MODE_CONCISE
         return mode
+
+    def _max_pending_limit(self) -> int:
+        """读取每用户待办上限，并兼容旧的每范围配置键。"""
+
+        configured = getattr(self, "_configured_max_pending", None)
+        if configured is None:
+            configured = self.get_config("max_pending_todos_per_user", None)
+        if configured is None:
+            configured = self.get_config("max_pending_todos_per_scope", 100)
+        return _positive_int(configured, 100)
 
     def _resolve_target(
         self,
@@ -702,6 +760,16 @@ def _event_text(event: GroupMessageEvent | PrivateMessageEvent) -> str:
     if raw_message is not None:
         return str(raw_message).strip()
     return ""
+
+
+def _event_user_id(event: GroupMessageEvent | PrivateMessageEvent) -> str:
+    """兼容从事件顶层或 sender 对象读取发送者 QQ 号。"""
+
+    sender = getattr(event, "sender", None)
+    user_id = getattr(sender, "user_id", None) if sender is not None else None
+    if user_id is None:
+        user_id = getattr(event, "user_id", "")
+    return str(user_id)
 
 
 def _positive_int(value: Any, default: int) -> int:

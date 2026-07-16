@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import secrets
 import sqlite3
+import time
 from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -17,6 +19,25 @@ STATUS_DONE = "done"
 STATUS_DELETED = "deleted"
 MODE_CONCISE = "concise"
 MODE_CATGIRL = "catgirl"
+OPERATION_PERMANENT_DELETE = "permanent_delete"
+
+
+class ReminderTimeValidationError(ValueError):
+    """提醒时间不符合当前业务规则。"""
+
+    def __init__(self, remind_at: int, now: int) -> None:
+        self.remind_at = int(remind_at)
+        self.now = int(now)
+        super().__init__("remind_at must be later than now")
+
+
+class TodoConfirmationError(ValueError):
+    """永久删除确认令牌无效、过期或不再匹配目标。"""
+
+    def __init__(self, code: str, **data: Any) -> None:
+        self.code = code
+        self.data = data
+        super().__init__(code)
 
 
 @dataclass(frozen=True)
@@ -45,7 +66,9 @@ class TodoReminder:
     """
 
     id: int
+    history_id: str
     todo_no: int
+    revision: int
     scope: str
     group_id: str | None
     user_id: str
@@ -59,6 +82,15 @@ class TodoReminder:
     created_at: int
     reminded_at: int | None
     llm_json: str | None
+
+
+@dataclass(frozen=True)
+class PermanentDeleteConfirmation:
+    """一次永久删除确认请求的持久化结果。"""
+
+    token: str
+    target_history_ids: tuple[str, ...]
+    expires_at: int
 
 
 class TodoStore:
@@ -82,7 +114,9 @@ class TodoStore:
                 """
                 CREATE TABLE IF NOT EXISTS todo_reminders (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    history_id TEXT NOT NULL UNIQUE,
                     todo_no INTEGER NOT NULL,
+                    revision INTEGER NOT NULL DEFAULT 1,
                     scope TEXT NOT NULL,
                     group_id TEXT,
                     user_id TEXT NOT NULL,
@@ -99,16 +133,31 @@ class TodoStore:
                 );
 
                 CREATE TABLE IF NOT EXISTS todo_reminder_modes (
-                    scope TEXT NOT NULL,
-                    group_id TEXT NOT NULL DEFAULT '',
                     user_id TEXT NOT NULL,
                     mode TEXT NOT NULL,
                     updated_at INTEGER NOT NULL,
-                    PRIMARY KEY (scope, group_id, user_id)
+                    PRIMARY KEY (user_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS todo_group_configs (
+                    group_id TEXT PRIMARY KEY,
+                    enabled INTEGER NOT NULL DEFAULT 0,
+                    updated_at INTEGER NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS todo_operation_confirmations (
+                    token TEXT PRIMARY KEY,
+                    user_id TEXT NOT NULL,
+                    operation_type TEXT NOT NULL,
+                    target_snapshot TEXT NOT NULL,
+                    expires_at INTEGER NOT NULL,
+                    created_at INTEGER NOT NULL
                 );
                 """
             )
             self._ensure_columns(conn)
+            self._ensure_mode_table(conn)
+            self._ensure_confirmation_table(conn)
             self._ensure_indexes(conn)
 
     def count_pending(self, scope: str, group_id: str | None, user_id: str) -> int:
@@ -128,12 +177,10 @@ class TodoStore:
                 """
                 SELECT COUNT(*)
                 FROM todo_reminders
-                WHERE scope = ?
-                  AND COALESCE(group_id, '') = COALESCE(?, '')
-                  AND user_id = ?
+                WHERE user_id = ?
                   AND status = ?
                 """,
-                (scope, group_id, user_id, STATUS_OPEN),
+                (user_id, STATUS_OPEN),
             ).fetchone()
         return int(row[0] if row else 0)
 
@@ -144,6 +191,7 @@ class TodoStore:
         user_id: str,
         drafts: list[TodoReminderDraft],
         now: int,
+        reject_past_reminder: bool = True,
     ) -> list[TodoReminder]:
         """在同一个事务中创建多条待办提醒记录。
 
@@ -166,14 +214,17 @@ class TodoStore:
 
         with self._connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            used_todo_numbers = self._used_open_todo_numbers(conn, scope, group_id, user_id)
+            used_todo_numbers = self._used_open_todo_numbers(conn, user_id)
             todo_ids: list[int] = []
             for draft in drafts:
+                validate_remind_at(draft.remind_at, now, reject_past_reminder)
                 todo_no = _first_available_todo_no(used_todo_numbers)
                 cursor = conn.execute(
                     """
                     INSERT INTO todo_reminders (
+                        history_id,
                         todo_no,
+                        revision,
                         scope,
                         group_id,
                         user_id,
@@ -187,9 +238,10 @@ class TodoStore:
                         created_at,
                         reminded_at,
                         llm_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+                    ) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
                     """,
                     (
+                        _new_history_id(),
                         todo_no,
                         scope,
                         group_id,
@@ -242,14 +294,12 @@ class TodoStore:
                 """
                 SELECT *
                 FROM todo_reminders
-                WHERE scope = ?
-                  AND COALESCE(group_id, '') = COALESCE(?, '')
-                  AND user_id = ?
+                WHERE user_id = ?
                   AND status = ?
                 ORDER BY remind_at IS NULL, remind_at, id
                 LIMIT ?
                 """,
-                (scope, group_id, user_id, STATUS_OPEN, int(limit)),
+                (user_id, STATUS_OPEN, int(limit)),
             ).fetchall()
         return [_row_to_todo(row) for row in rows]
 
@@ -275,7 +325,7 @@ class TodoStore:
         """
 
         where_status = ""
-        params: list[Any] = [scope, group_id, user_id]
+        params: list[Any] = [user_id]
         if status is not None:
             where_status = "AND status = ?"
             params.append(status)
@@ -286,9 +336,7 @@ class TodoStore:
                 f"""
                 SELECT *
                 FROM todo_reminders
-                WHERE scope = ?
-                  AND COALESCE(group_id, '') = COALESCE(?, '')
-                  AND user_id = ?
+                WHERE user_id = ?
                   {where_status}
                 ORDER BY
                   CASE status
@@ -376,7 +424,7 @@ class TodoStore:
             return None
 
         status_sql = ""
-        params: list[Any] = [scope, group_id, user_id, int(todo_no)]
+        params: list[Any] = [user_id, int(todo_no)]
         if statuses is not None:
             if not statuses:
                 return None
@@ -389,9 +437,7 @@ class TodoStore:
                 f"""
                 SELECT *
                 FROM todo_reminders
-                WHERE scope = ?
-                  AND COALESCE(group_id, '') = COALESCE(?, '')
-                  AND user_id = ?
+                WHERE user_id = ?
                   AND todo_no = ?
                   {status_sql}
                 ORDER BY
@@ -409,7 +455,188 @@ class TodoStore:
             ).fetchone()
         return _row_to_todo(row) if row is not None else None
 
-    def complete(self, todo_id: int) -> TodoReminder | None:
+    def find_by_history_id(
+        self,
+        user_id: str,
+        history_id: str,
+        statuses: Sequence[str] | None = None,
+    ) -> TodoReminder | None:
+        """按不可复用的用户可见历史 ID 查找待办。"""
+
+        history_id = str(history_id).strip()
+        if not history_id:
+            return None
+        status_sql = ""
+        params: list[Any] = [str(user_id), history_id]
+        if statuses is not None:
+            if not statuses:
+                return None
+            placeholders = ",".join("?" for _ in statuses)
+            status_sql = f"AND status IN ({placeholders})"
+            params.extend(statuses)
+        with self._connect() as conn:
+            row = conn.execute(
+                f"""
+                SELECT *
+                FROM todo_reminders
+                WHERE user_id = ?
+                  AND history_id = ?
+                  {status_sql}
+                """,
+                params,
+            ).fetchone()
+        return _row_to_todo(row) if row is not None else None
+
+    def find_by_history_ids(
+        self,
+        user_id: str,
+        history_ids: Sequence[str],
+        statuses: Sequence[str] | None = None,
+    ) -> list[TodoReminder]:
+        """按输入顺序批量查找稳定历史 ID，对缺失目标不作猜测。"""
+
+        normalized_ids = _unique_history_ids(history_ids)
+        if not normalized_ids:
+            return []
+        placeholders = ",".join("?" for _ in normalized_ids)
+        status_sql = ""
+        params: list[Any] = [str(user_id), *normalized_ids]
+        if statuses is not None:
+            if not statuses:
+                return []
+            status_placeholders = ",".join("?" for _ in statuses)
+            status_sql = f"AND status IN ({status_placeholders})"
+            params.extend(statuses)
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT *
+                FROM todo_reminders
+                WHERE user_id = ?
+                  AND history_id IN ({placeholders})
+                  {status_sql}
+                """,
+                params,
+            ).fetchall()
+        by_history_id = {str(row["history_id"]): _row_to_todo(row) for row in rows}
+        return [by_history_id[history_id] for history_id in normalized_ids if history_id in by_history_id]
+
+    def complete_many(self, todo_ids: Sequence[int], user_id: str) -> list[TodoReminder] | None:
+        """原子完成多条待办；任一目标失效则全部不写入。"""
+
+        return self._transition_many(todo_ids, str(user_id), STATUS_OPEN, STATUS_DONE)
+
+    def restore_many(
+        self,
+        todo_ids: Sequence[int],
+        user_id: str,
+        now: int,
+        reject_past_reminder: bool,
+    ) -> list[TodoReminder] | None:
+        """原子恢复多条历史待办，并在事务内复核提醒时间。"""
+
+        target_ids = _unique_ints(todo_ids)
+        if not target_ids:
+            return []
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            items = self._load_exact_targets(conn, target_ids, str(user_id))
+            if items is None or any(item.status not in {STATUS_DONE, STATUS_DELETED} for item in items):
+                return None
+            for item in items:
+                validate_remind_at(item.remind_at, now, reject_past_reminder)
+
+            used_numbers = self._used_open_todo_numbers(conn, str(user_id))
+            restored_ids: list[int] = []
+            for item in items:
+                todo_no = item.todo_no
+                if todo_no in used_numbers:
+                    todo_no = _first_available_todo_no(used_numbers)
+                used_numbers.add(todo_no)
+                cursor = conn.execute(
+                    """
+                    UPDATE todo_reminders
+                    SET status = ?, reminded_at = NULL, todo_no = ?, revision = revision + 1
+                    WHERE id = ?
+                      AND user_id = ?
+                      AND status IN (?, ?)
+                    """,
+                    (
+                        STATUS_OPEN,
+                        todo_no,
+                        item.id,
+                        str(user_id),
+                        STATUS_DONE,
+                        STATUS_DELETED,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    return None
+                restored_ids.append(item.id)
+            return self._load_exact_targets(conn, restored_ids, str(user_id))
+
+    def merge_open_todos(
+        self,
+        todo_ids: Sequence[int],
+        user_id: str,
+        updates: dict[str, Any],
+        now: int,
+        reject_past_reminder: bool,
+    ) -> TodoReminder | None:
+        """原子合并未完成待办：更新第一条并取消其余目标。"""
+
+        target_ids = _unique_ints(todo_ids)
+        if len(target_ids) < 2:
+            raise ValueError("merge requires at least two todos")
+        allowed_fields = {
+            "title",
+            "content",
+            "raw_text",
+            "remind_at",
+            "due_at",
+            "reminder_text",
+        }
+        unknown_fields = set(updates) - allowed_fields
+        if unknown_fields:
+            raise ValueError(f"unsupported todo fields: {sorted(unknown_fields)}")
+        if not updates:
+            raise ValueError("updates cannot be empty")
+
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            items = self._load_exact_targets(conn, target_ids, str(user_id))
+            if items is None or any(item.status != STATUS_OPEN for item in items):
+                return None
+            validate_remind_at(updates.get("remind_at"), now, reject_past_reminder)
+            assignments = ", ".join(f"{field} = ?" for field in updates)
+            cursor = conn.execute(
+                f"""
+                UPDATE todo_reminders
+                SET {assignments}, revision = revision + 1
+                WHERE id = ? AND user_id = ? AND status = ?
+                """,
+                [*updates.values(), items[0].id, str(user_id), STATUS_OPEN],
+            )
+            if cursor.rowcount != 1:
+                return None
+            for item in items[1:]:
+                cursor = conn.execute(
+                    """
+                    UPDATE todo_reminders
+                    SET status = ?, revision = revision + 1
+                    WHERE id = ? AND user_id = ? AND status = ?
+                    """,
+                    (STATUS_DELETED, item.id, str(user_id), STATUS_OPEN),
+                )
+                if cursor.rowcount != 1:
+                    return None
+            row = conn.execute(
+                "SELECT * FROM todo_reminders WHERE id = ?",
+                (items[0].id,),
+            ).fetchone()
+        return _row_to_todo(row) if row is not None else None
+
+    def complete(self, todo_id: int, user_id: str | None = None) -> TodoReminder | None:
         """把待办标记为已完成。
 
         Args:
@@ -419,9 +646,9 @@ class TodoStore:
             更新后的待办记录；待办不存在或状态不是 `open` 时返回 None。
         """
 
-        return self._transition(todo_id, STATUS_OPEN, STATUS_DONE)
+        return self._transition(todo_id, STATUS_OPEN, STATUS_DONE, user_id)
 
-    def cancel(self, todo_id: int) -> TodoReminder | None:
+    def cancel(self, todo_id: int, user_id: str | None = None) -> TodoReminder | None:
         """把待办标记为已删除。
 
         Args:
@@ -431,9 +658,15 @@ class TodoStore:
             更新后的待办记录；待办不存在或状态不是 `open` 时返回 None。
         """
 
-        return self._transition(todo_id, STATUS_OPEN, STATUS_DELETED)
+        return self._transition(todo_id, STATUS_OPEN, STATUS_DELETED, user_id)
 
-    def restore(self, todo_id: int) -> TodoReminder | None:
+    def restore(
+        self,
+        todo_id: int,
+        user_id: str | None = None,
+        now: int | None = None,
+        reject_past_reminder: bool = True,
+    ) -> TodoReminder | None:
         """把已完成或已删除的待办恢复为未完成。
 
         恢复时如果原展示编号已经被新的未完成待办占用，会重新分配当前范围内
@@ -455,15 +688,17 @@ class TodoStore:
             if row is None:
                 return None
             item = _row_to_todo(row)
+            if user_id is not None and item.user_id != str(user_id):
+                return None
             if item.status not in {STATUS_DONE, STATUS_DELETED}:
                 return None
-
-            used_numbers = self._used_open_todo_numbers(
-                conn,
-                item.scope,
-                item.group_id,
-                item.user_id,
+            validate_remind_at(
+                item.remind_at,
+                int(time.time()) if now is None else int(now),
+                reject_past_reminder,
             )
+
+            used_numbers = self._used_open_todo_numbers(conn, item.user_id)
             todo_no = item.todo_no
             if todo_no in used_numbers:
                 todo_no = _first_available_todo_no(used_numbers)
@@ -473,14 +708,17 @@ class TodoStore:
                 UPDATE todo_reminders
                 SET status = ?,
                     reminded_at = NULL,
-                    todo_no = ?
+                    todo_no = ?,
+                    revision = revision + 1
                 WHERE id = ?
+                  AND user_id = ?
                   AND status IN (?, ?)
                 """,
                 (
                     STATUS_OPEN,
                     todo_no,
                     int(todo_id),
+                    item.user_id,
                     STATUS_DONE,
                     STATUS_DELETED,
                 ),
@@ -493,7 +731,7 @@ class TodoStore:
             ).fetchone()
         return _row_to_todo(restored) if restored is not None else None
 
-    def delete_permanent(self, todo_id: int) -> bool:
+    def delete_permanent(self, todo_id: int, user_id: str | None = None) -> bool:
         """永久删除一条待办记录。
 
         Args:
@@ -504,17 +742,127 @@ class TodoStore:
         """
 
         with self._connect() as conn:
-            cursor = conn.execute(
-                "DELETE FROM todo_reminders WHERE id = ?",
-                (int(todo_id),),
-            )
+            sql = "DELETE FROM todo_reminders WHERE id = ?"
+            params: list[Any] = [int(todo_id)]
+            if user_id is not None:
+                sql += " AND user_id = ?"
+                params.append(user_id)
+            cursor = conn.execute(sql, params)
         return cursor.rowcount > 0
+
+    def create_permanent_delete_confirmation(
+        self,
+        user_id: str,
+        items: Sequence[TodoReminder],
+        now: int,
+        ttl_seconds: int,
+    ) -> PermanentDeleteConfirmation:
+        """持久化一次永久删除的确认令牌和目标版本快照。"""
+
+        if not items:
+            raise ValueError("confirmation targets cannot be empty")
+        target_snapshot = [
+            {"history_id": item.history_id, "revision": item.revision}
+            for item in items
+        ]
+        token = f"del_{secrets.token_urlsafe(24)}"
+        expires_at = int(now) + max(1, int(ttl_seconds))
+        with self._connect() as conn:
+            conn.execute(
+                "DELETE FROM todo_operation_confirmations WHERE expires_at <= ?",
+                (int(now),),
+            )
+            conn.execute(
+                """
+                INSERT INTO todo_operation_confirmations (
+                    token, user_id, operation_type, target_snapshot, expires_at, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    token,
+                    str(user_id),
+                    OPERATION_PERMANENT_DELETE,
+                    json.dumps(target_snapshot, ensure_ascii=False, separators=(",", ":")),
+                    expires_at,
+                    int(now),
+                ),
+            )
+        return PermanentDeleteConfirmation(
+            token=token,
+            target_history_ids=tuple(item.history_id for item in items),
+            expires_at=expires_at,
+        )
+
+    def permanently_delete_confirmed(
+        self,
+        token: str,
+        user_id: str,
+        history_ids: Sequence[str],
+        now: int,
+    ) -> list[TodoReminder]:
+        """原子验证确认令牌并永久删除其初始目标。"""
+
+        target_history_ids = _unique_history_ids(history_ids)
+        if not target_history_ids:
+            raise TodoConfirmationError("confirmation_target_mismatch")
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                """
+                SELECT target_snapshot, expires_at
+                FROM todo_operation_confirmations
+                WHERE token = ? AND user_id = ? AND operation_type = ?
+                """,
+                (str(token), str(user_id), OPERATION_PERMANENT_DELETE),
+            ).fetchone()
+            if row is None:
+                raise TodoConfirmationError("confirmation_invalid")
+            if int(row["expires_at"]) <= int(now):
+                raise TodoConfirmationError("confirmation_expired")
+            try:
+                snapshot = json.loads(str(row["target_snapshot"]))
+                expected_history_ids = tuple(str(entry["history_id"]) for entry in snapshot)
+                expected_revisions = {
+                    str(entry["history_id"]): int(entry["revision"])
+                    for entry in snapshot
+                }
+            except (TypeError, ValueError, KeyError) as exc:
+                raise TodoConfirmationError("confirmation_invalid") from exc
+            if tuple(target_history_ids) != expected_history_ids:
+                raise TodoConfirmationError(
+                    "confirmation_target_mismatch",
+                    expected_history_ids=list(expected_history_ids),
+                )
+
+            items = self._load_exact_history_targets(conn, target_history_ids, str(user_id))
+            if items is None or any(
+                item.revision != expected_revisions.get(item.history_id) for item in items
+            ):
+                raise TodoConfirmationError("confirmation_target_changed")
+            placeholders = ",".join("?" for _ in target_history_ids)
+            cursor = conn.execute(
+                f"""
+                DELETE FROM todo_reminders
+                WHERE user_id = ? AND history_id IN ({placeholders})
+                """,
+                [str(user_id), *target_history_ids],
+            )
+            if cursor.rowcount != len(items):
+                raise TodoConfirmationError("confirmation_target_changed")
+            conn.execute(
+                "DELETE FROM todo_operation_confirmations WHERE token = ?",
+                (str(token),),
+            )
+        return items
 
     def update_fields(
         self,
         todo_id: int,
         updates: dict[str, Any],
         expected_status: str | None = STATUS_OPEN,
+        user_id: str | None = None,
+        now: int | None = None,
+        reject_past_reminder: bool = True,
     ) -> TodoReminder | None:
         """更新一条待办的可编辑字段。
 
@@ -540,10 +888,18 @@ class TodoStore:
             raise ValueError(f"unsupported todo fields: {sorted(unknown_fields)}")
         if not updates:
             raise ValueError("updates cannot be empty")
+        if "remind_at" in updates:
+            if now is None:
+                raise ValueError("now is required when updating remind_at")
+            validate_remind_at(updates["remind_at"], now, reject_past_reminder)
 
         assignments = ", ".join(f"{field} = ?" for field in updates)
         params: list[Any] = list(updates.values())
         params.append(int(todo_id))
+        user_sql = ""
+        if user_id is not None:
+            user_sql = "AND user_id = ?"
+            params.append(user_id)
         status_sql = ""
         if expected_status is not None:
             status_sql = "AND status = ?"
@@ -553,8 +909,9 @@ class TodoStore:
             cursor = conn.execute(
                 f"""
                 UPDATE todo_reminders
-                SET {assignments}
+                SET {assignments}, revision = revision + 1
                 WHERE id = ?
+                  {user_sql}
                   {status_sql}
                 """,
                 params,
@@ -594,7 +951,7 @@ class TodoStore:
             ).fetchall()
         return [_row_to_todo(row) for row in rows]
 
-    def mark_reminded(self, todo_id: int, now: int) -> None:
+    def mark_reminded(self, todo_id: int, now: int, user_id: str | None = None) -> None:
         """标记待办已经提醒过，并自动软删除。
 
         Args:
@@ -603,16 +960,54 @@ class TodoStore:
         """
 
         with self._connect() as conn:
+            user_sql = ""
+            params: list[Any] = [int(now), STATUS_DELETED, int(todo_id)]
+            if user_id is not None:
+                user_sql = "AND user_id = ?"
+                params.append(user_id)
+            params.append(STATUS_OPEN)
             conn.execute(
-                """
+                f"""
                 UPDATE todo_reminders
                 SET reminded_at = ?,
-                    status = ?
+                    status = ?,
+                    revision = revision + 1
                 WHERE id = ?
+                  {user_sql}
                   AND reminded_at IS NULL
                   AND status = ?
                 """,
-                (int(now), STATUS_DELETED, int(todo_id), STATUS_OPEN),
+                params,
+            )
+
+    def is_group_todo_enabled(self, group_id: str) -> bool:
+        """读取群待办开关；没有配置的群默认关闭。"""
+
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT enabled FROM todo_group_configs WHERE group_id = ?",
+                (str(group_id),),
+            ).fetchone()
+        return bool(row and int(row["enabled"]))
+
+    def get_group_todo_enabled(self, group_id: str) -> bool:
+        """`is_group_todo_enabled` 的兼容别名。"""
+
+        return self.is_group_todo_enabled(group_id)
+
+    def set_group_todo_enabled(self, group_id: str, enabled: bool, now: int) -> None:
+        """持久化群待办开关状态。"""
+
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO todo_group_configs (group_id, enabled, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(group_id) DO UPDATE SET
+                    enabled = excluded.enabled,
+                    updated_at = excluded.updated_at
+                """,
+                (str(group_id), 1 if enabled else 0, int(now)),
             )
 
     def get_mode(self, scope: str, group_id: str | None, user_id: str) -> str:
@@ -632,11 +1027,9 @@ class TodoStore:
                 """
                 SELECT mode
                 FROM todo_reminder_modes
-                WHERE scope = ?
-                  AND group_id = ?
-                  AND user_id = ?
+                WHERE user_id = ?
                 """,
-                (scope, _group_key(group_id), user_id),
+                (user_id,),
             ).fetchone()
         if row is None:
             return MODE_CONCISE
@@ -666,18 +1059,13 @@ class TodoStore:
         with self._connect() as conn:
             conn.execute(
                 """
-                INSERT INTO todo_reminder_modes (
-                    scope,
-                    group_id,
-                    user_id,
-                    mode,
-                    updated_at
-                ) VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(scope, group_id, user_id) DO UPDATE SET
+                INSERT INTO todo_reminder_modes (user_id, mode, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
                     mode = excluded.mode,
                     updated_at = excluded.updated_at
                 """,
-                (scope, _group_key(group_id), user_id, mode, int(now)),
+                (user_id, mode, int(now)),
             )
 
     def _transition(
@@ -685,6 +1073,7 @@ class TodoStore:
         todo_id: int,
         from_status: str,
         to_status: str,
+        user_id: str | None = None,
     ) -> TodoReminder | None:
         """在指定原状态匹配时切换待办状态。
 
@@ -698,14 +1087,21 @@ class TodoStore:
         """
 
         with self._connect() as conn:
+            user_sql = ""
+            params: list[Any] = [to_status, int(todo_id)]
+            if user_id is not None:
+                user_sql = "AND user_id = ?"
+                params.append(user_id)
+            params.append(from_status)
             cursor = conn.execute(
-                """
+                f"""
                 UPDATE todo_reminders
-                SET status = ?
+                SET status = ?, revision = revision + 1
                 WHERE id = ?
+                  {user_sql}
                   AND status = ?
                 """,
-                (to_status, int(todo_id), from_status),
+                params,
             )
             if cursor.rowcount == 0:
                 return None
@@ -714,6 +1110,86 @@ class TodoStore:
                 (int(todo_id),),
             ).fetchone()
         return _row_to_todo(row) if row is not None else None
+
+    def _transition_many(
+        self,
+        todo_ids: Sequence[int],
+        user_id: str,
+        from_status: str,
+        to_status: str,
+    ) -> list[TodoReminder] | None:
+        """在一个事务内完成同状态的多条转换。"""
+
+        target_ids = _unique_ints(todo_ids)
+        if not target_ids:
+            return []
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            items = self._load_exact_targets(conn, target_ids, user_id)
+            if items is None or any(item.status != from_status for item in items):
+                return None
+            placeholders = ",".join("?" for _ in target_ids)
+            cursor = conn.execute(
+                f"""
+                UPDATE todo_reminders
+                SET status = ?, revision = revision + 1
+                WHERE user_id = ?
+                  AND status = ?
+                  AND id IN ({placeholders})
+                """,
+                [to_status, user_id, from_status, *target_ids],
+            )
+            if cursor.rowcount != len(target_ids):
+                return None
+            return self._load_exact_targets(conn, target_ids, user_id)
+
+    @staticmethod
+    def _load_exact_targets(
+        conn: sqlite3.Connection,
+        todo_ids: Sequence[int],
+        user_id: str,
+    ) -> list[TodoReminder] | None:
+        """加载所有内部目标，缺失或越权时返回 None。"""
+
+        target_ids = _unique_ints(todo_ids)
+        if not target_ids:
+            return []
+        placeholders = ",".join("?" for _ in target_ids)
+        rows = conn.execute(
+            f"""
+            SELECT * FROM todo_reminders
+            WHERE user_id = ? AND id IN ({placeholders})
+            """,
+            [user_id, *target_ids],
+        ).fetchall()
+        if len(rows) != len(target_ids):
+            return None
+        by_id = {int(row["id"]): _row_to_todo(row) for row in rows}
+        return [by_id[todo_id] for todo_id in target_ids]
+
+    @staticmethod
+    def _load_exact_history_targets(
+        conn: sqlite3.Connection,
+        history_ids: Sequence[str],
+        user_id: str,
+    ) -> list[TodoReminder] | None:
+        """加载所有稳定历史目标，缺失或越权时返回 None。"""
+
+        target_history_ids = _unique_history_ids(history_ids)
+        if not target_history_ids:
+            return []
+        placeholders = ",".join("?" for _ in target_history_ids)
+        rows = conn.execute(
+            f"""
+            SELECT * FROM todo_reminders
+            WHERE user_id = ? AND history_id IN ({placeholders})
+            """,
+            [user_id, *target_history_ids],
+        ).fetchall()
+        if len(rows) != len(target_history_ids):
+            return None
+        by_history_id = {str(row["history_id"]): _row_to_todo(row) for row in rows}
+        return [by_history_id[history_id] for history_id in target_history_ids]
 
     def _ensure_columns(self, conn: sqlite3.Connection) -> None:
         """为旧版本数据库补齐新增字段。
@@ -728,6 +1204,12 @@ class TodoStore:
         }
         if "todo_no" not in columns:
             conn.execute("ALTER TABLE todo_reminders ADD COLUMN todo_no INTEGER")
+        if "history_id" not in columns:
+            conn.execute("ALTER TABLE todo_reminders ADD COLUMN history_id TEXT")
+        if "revision" not in columns:
+            conn.execute(
+                "ALTER TABLE todo_reminders ADD COLUMN revision INTEGER NOT NULL DEFAULT 1"
+            )
         if "content" not in columns:
             conn.execute("ALTER TABLE todo_reminders ADD COLUMN content TEXT")
         if "due_at" not in columns:
@@ -737,7 +1219,63 @@ class TodoStore:
                 "ALTER TABLE todo_reminders ADD COLUMN reminder_text TEXT NOT NULL DEFAULT ''"
             )
         self._backfill_todo_no(conn)
+        self._backfill_history_ids(conn)
+        conn.execute("UPDATE todo_reminders SET revision = 1 WHERE revision IS NULL OR revision < 1")
         self._ensure_remind_at_nullable(conn)
+
+    @staticmethod
+    def _ensure_confirmation_table(conn: sqlite3.Connection) -> None:
+        """兼容旧库：补建永久删除确认状态表。"""
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS todo_operation_confirmations (
+                token TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                operation_type TEXT NOT NULL,
+                target_snapshot TEXT NOT NULL,
+                expires_at INTEGER NOT NULL,
+                created_at INTEGER NOT NULL
+            )
+            """
+        )
+
+    @staticmethod
+    def _ensure_mode_table(conn: sqlite3.Connection) -> None:
+        """把旧的按会话保存的提醒模式迁移为按用户保存。"""
+
+        columns = {
+            str(row["name"]): row
+            for row in conn.execute("PRAGMA table_info(todo_reminder_modes)").fetchall()
+        }
+        if set(columns) == {"user_id", "mode", "updated_at"} and int(columns["user_id"]["pk"]) == 1:
+            return
+
+        rows = conn.execute(
+            "SELECT user_id, mode, updated_at FROM todo_reminder_modes "
+            "ORDER BY updated_at DESC, rowid DESC"
+        ).fetchall()
+        conn.execute(
+            """
+            CREATE TABLE todo_reminder_modes_new (
+                user_id TEXT PRIMARY KEY,
+                mode TEXT NOT NULL,
+                updated_at INTEGER NOT NULL
+            )
+            """
+        )
+        seen: set[str] = set()
+        for row in rows:
+            user_id = str(row["user_id"])
+            if user_id in seen:
+                continue
+            seen.add(user_id)
+            conn.execute(
+                "INSERT INTO todo_reminder_modes_new (user_id, mode, updated_at) VALUES (?, ?, ?)",
+                (user_id, str(row["mode"]), int(row["updated_at"])),
+            )
+        conn.execute("DROP TABLE todo_reminder_modes")
+        conn.execute("ALTER TABLE todo_reminder_modes_new RENAME TO todo_reminder_modes")
 
     @staticmethod
     def _ensure_remind_at_nullable(conn: sqlite3.Connection) -> None:
@@ -759,7 +1297,9 @@ class TodoStore:
             """
             CREATE TABLE todo_reminders_new (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                history_id TEXT NOT NULL UNIQUE,
                 todo_no INTEGER NOT NULL,
+                revision INTEGER NOT NULL DEFAULT 1,
                 scope TEXT NOT NULL,
                 group_id TEXT,
                 user_id TEXT NOT NULL,
@@ -777,7 +1317,9 @@ class TodoStore:
 
             INSERT INTO todo_reminders_new (
                 id,
+                history_id,
                 todo_no,
+                revision,
                 scope,
                 group_id,
                 user_id,
@@ -794,7 +1336,9 @@ class TodoStore:
             )
             SELECT
                 id,
+                history_id,
                 todo_no,
+                revision,
                 scope,
                 group_id,
                 user_id,
@@ -823,18 +1367,28 @@ class TodoStore:
         """
 
         conn.execute("DROP INDEX IF EXISTS idx_todo_scope_user_no")
+        conn.execute("DROP INDEX IF EXISTS idx_todo_user_no")
+        conn.execute("DROP INDEX IF EXISTS idx_todo_scope_status_remind")
+        conn.execute("DROP INDEX IF EXISTS idx_todo_user_status_remind")
+        conn.execute("DROP INDEX IF EXISTS idx_todo_history_id")
         self._repair_open_todo_numbers(conn)
         conn.executescript(
             """
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_todo_scope_user_no
-            ON todo_reminders(scope, IFNULL(group_id, ''), user_id, todo_no)
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_todo_user_no
+            ON todo_reminders(user_id, todo_no)
             WHERE status = 'open';
 
-            CREATE INDEX IF NOT EXISTS idx_todo_scope_status_remind
-            ON todo_reminders(scope, group_id, user_id, status, remind_at, id);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_todo_history_id
+            ON todo_reminders(history_id);
+
+            CREATE INDEX IF NOT EXISTS idx_todo_user_status_remind
+            ON todo_reminders(user_id, status, remind_at, id);
 
             CREATE INDEX IF NOT EXISTS idx_todo_due
             ON todo_reminders(status, reminded_at, remind_at, id);
+
+            CREATE INDEX IF NOT EXISTS idx_todo_confirmation_expiry
+            ON todo_operation_confirmations(expires_at);
             """
         )
 
@@ -852,16 +1406,16 @@ class TodoStore:
 
         rows = conn.execute(
             """
-            SELECT id, scope, group_id, user_id, todo_no
+            SELECT id, user_id, todo_no
             FROM todo_reminders
             WHERE status = ?
-            ORDER BY scope, COALESCE(group_id, ''), user_id, created_at, id
+            ORDER BY user_id, created_at, id
             """,
             (STATUS_OPEN,),
         ).fetchall()
-        grouped_rows: dict[tuple[str, str, str], list[sqlite3.Row]] = {}
+        grouped_rows: dict[str, list[sqlite3.Row]] = {}
         for row in rows:
-            key = (str(row["scope"]), _group_key(row["group_id"]), str(row["user_id"]))
+            key = str(row["user_id"])
             grouped_rows.setdefault(key, []).append(row)
 
         for group_rows in grouped_rows.values():
@@ -885,8 +1439,6 @@ class TodoStore:
     @staticmethod
     def _used_open_todo_numbers(
         conn: sqlite3.Connection,
-        scope: str,
-        group_id: str | None,
         user_id: str,
     ) -> set[int]:
         """查询同一范围内当前未完成待办已经占用的显示序号。
@@ -905,12 +1457,10 @@ class TodoStore:
             """
             SELECT todo_no
             FROM todo_reminders
-            WHERE scope = ?
-              AND COALESCE(group_id, '') = COALESCE(?, '')
-              AND user_id = ?
+            WHERE user_id = ?
               AND status = ?
             """,
-            (scope, group_id, user_id, STATUS_OPEN),
+            (user_id, STATUS_OPEN),
         ).fetchall()
         return {int(row["todo_no"]) for row in rows}
 
@@ -924,25 +1474,23 @@ class TodoStore:
 
         rows = conn.execute(
             """
-            SELECT id, scope, group_id, user_id
+            SELECT id, user_id
             FROM todo_reminders
             WHERE todo_no IS NULL
-            ORDER BY scope, COALESCE(group_id, ''), user_id, created_at, id
+            ORDER BY user_id, created_at, id
             """
         ).fetchall()
-        next_numbers: dict[tuple[str, str, str], int] = {}
+        next_numbers: dict[str, int] = {}
         for row in rows:
-            key = (str(row["scope"]), _group_key(row["group_id"]), str(row["user_id"]))
+            key = str(row["user_id"])
             if key not in next_numbers:
                 max_row = conn.execute(
                     """
                     SELECT COALESCE(MAX(todo_no), 0)
                     FROM todo_reminders
-                    WHERE scope = ?
-                      AND COALESCE(group_id, '') = ?
-                      AND user_id = ?
+                    WHERE user_id = ?
                     """,
-                    key,
+                    (key,),
                 ).fetchone()
                 next_numbers[key] = int(max_row[0] if max_row else 0) + 1
 
@@ -951,6 +1499,26 @@ class TodoStore:
                 (next_numbers[key], int(row["id"])),
             )
             next_numbers[key] += 1
+
+    @staticmethod
+    def _backfill_history_ids(conn: sqlite3.Connection) -> None:
+        """为旧记录生成稳定且不会与新 ID 复用的历史标识。"""
+
+        rows = conn.execute(
+            """
+            SELECT id
+            FROM todo_reminders
+            WHERE history_id IS NULL OR TRIM(history_id) = ''
+            ORDER BY id
+            """
+        ).fetchall()
+        for row in rows:
+            # 迁移 ID 直接锚定旧主键；新记录使用随机 ID，二者永不复用。
+            history_id = f"H-{int(row['id']):012d}"
+            conn.execute(
+                "UPDATE todo_reminders SET history_id = ? WHERE id = ?",
+                (history_id, int(row["id"])),
+            )
 
     @contextmanager
     def _connect(self) -> Generator[sqlite3.Connection, None, None]:
@@ -1007,6 +1575,42 @@ def parse_pending_target_number(target: str) -> int | None:
     return number if number > 0 else None
 
 
+def validate_remind_at(
+    remind_at: int | None,
+    now: int,
+    reject_past_reminder: bool,
+) -> None:
+    """唯一的提醒时间有效性校验入口。"""
+
+    if reject_past_reminder and remind_at is not None and int(remind_at) <= int(now):
+        raise ReminderTimeValidationError(int(remind_at), int(now))
+
+
+def _new_history_id() -> str:
+    """生成不可预测、不可复用的用户可见历史 ID。"""
+
+    return f"H-{secrets.token_hex(12)}"
+
+
+def _unique_history_ids(history_ids: Sequence[str]) -> list[str]:
+    """规范化并保持用户指定的历史 ID 顺序。"""
+
+    values: list[str] = []
+    seen: set[str] = set()
+    for value in history_ids:
+        normalized = str(value).strip()
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            values.append(normalized)
+    return values
+
+
+def _unique_ints(values: Sequence[int]) -> list[int]:
+    """去重并保留内部主键的调用顺序。"""
+
+    return list(dict.fromkeys(int(value) for value in values))
+
+
 def _row_to_todo(row: sqlite3.Row) -> TodoReminder:
     """把 SQLite 行对象转换为 TodoReminder。
 
@@ -1019,7 +1623,9 @@ def _row_to_todo(row: sqlite3.Row) -> TodoReminder:
 
     return TodoReminder(
         id=int(row["id"]),
+        history_id=str(row["history_id"]),
         todo_no=int(row["todo_no"]),
+        revision=int(row["revision"]),
         scope=str(row["scope"]),
         group_id=row["group_id"],
         user_id=str(row["user_id"]),

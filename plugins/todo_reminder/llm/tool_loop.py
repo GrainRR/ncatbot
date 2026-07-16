@@ -7,14 +7,15 @@ from datetime import datetime
 from typing import Any
 
 from ..todo_manage_tools import ToolResult, TodoToolContext, TodoToolExecutor
-from ..todo_store import STATUS_DONE, STATUS_OPEN, TodoReminder, TodoStore
+from ..todo_store import STATUS_DELETED, STATUS_DONE, STATUS_OPEN, TodoReminder, TodoStore
 from .openai_chat import ChatCompletionChoice, OpenAICompatibleChatClient
 
 
 TODO_TOOL_LOOP_SYSTEM_PROMPT = (
     "你是 Todo 工具选择器。你不能直接声称数据库操作成功，也不能编造数据库结果。"
     "凡是新增、完成、修改、取消、恢复、删除、合并、推迟、提前、延后、改提醒、改时间等写操作，"
-    "必须调用一个最合适的工具。工具参数里的 number 只能使用用户当前可见编号，禁止使用或伪造数据库 id。"
+    "必须调用一个最合适的工具。number 只能用于当前未完成待办；恢复和永久删除必须使用列表中的 history_id，禁止使用或伪造数据库 id。"
+    "永久删除首次调用只会返回确认令牌；confirmed=true 不能删除，第二次调用必须带相同 history_id 和 confirmation_token。"
     "创建待办时，如果运行时 reminder_mode 是 catgirl，必须在 create_todo.reminder_text 中写入猫娘风格提醒文案；"
     "如果 reminder_mode 是 concise，reminder_text 使用简洁直接的提醒文案或 null。"
     "不要把猫娘语气写入 title、content、reminder_at、due_at 或工具结果。"
@@ -169,6 +170,13 @@ class TodoToolLoop:
             STATUS_DONE,
             20,
         )
+        canceled = self.store.list_by_status(
+            context.scope,
+            context.group_id,
+            context.user_id,
+            STATUS_DELETED,
+            20,
+        )
         now = datetime.fromtimestamp(context.now, context.timezone)
         user_prompt = (
             "运行时上下文：\n"
@@ -180,6 +188,8 @@ class TodoToolLoop:
             f"{_format_visible_todos(pending)}\n\n"
             "用户当前可见已完成待办：\n"
             f"{_format_visible_todos(completed)}\n\n"
+            "用户当前可见已取消待办：\n"
+            f"{_format_visible_todos(canceled)}\n\n"
             "用户原文：\n"
             f"{user_text}"
         )
@@ -220,7 +230,7 @@ def _format_visible_todos(items: list[TodoReminder]) -> str:
         reminder_at = _format_timestamp(item.remind_at)
         due_at = _format_timestamp(item.due_at)
         rows.append(
-            f"[{item.todo_no}] {item.title} | status={item.status} | reminder_at={reminder_at} | due_at={due_at}"
+            f"[{item.todo_no}] {item.title} | history_id={item.history_id} | status={item.status} | reminder_at={reminder_at} | due_at={due_at}"
         )
     return "\n".join(rows)
 

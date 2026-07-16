@@ -90,6 +90,7 @@ def create_todo(
         context.user_id,
         drafts,
         context.now,
+        context.reject_past_reminder,
     )[0]
     return ToolResult(
         ok=True,

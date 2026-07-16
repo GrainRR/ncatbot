@@ -8,11 +8,13 @@ from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 from ..todo_store import (
+    ReminderTimeValidationError,
     STATUS_DELETED,
     STATUS_DONE,
     STATUS_OPEN,
     TodoReminder,
     TodoStore,
+    validate_remind_at,
 )
 
 
@@ -56,6 +58,7 @@ class TodoToolContext:
     timezone: ZoneInfo
     max_pending: int = 100
     reject_past_reminder: bool = True
+    permanent_delete_confirmation_ttl_seconds: int = 300
     last_todo_no: int | None = None
     reminder_mode: str = "concise"
     user_text: str = ""
@@ -381,17 +384,20 @@ def parse_optional_time(
     if text is None:
         return None
     parsed = _parse_local_datetime(text, context.timezone)
-    if field_name == "reminder_at" and context.reject_past_reminder:
-        if int(parsed.timestamp()) <= context.now:
+    timestamp = int(parsed.timestamp())
+    if field_name == "reminder_at":
+        try:
+            validate_remind_at(timestamp, context.now, context.reject_past_reminder)
+        except ReminderTimeValidationError as exc:
             raise ToolExecutionStop(
                 ToolResult(
                     ok=False,
                     status="error",
-                    message="提醒时间已经过去，待办没有写入",
-                    data={"field": field_name, "value": text},
+                    message="提醒时间必须晚于当前时间，待办没有写入",
+                    data={"code": "remind_at_not_future", "remind_at": exc.remind_at, "now": exc.now},
                 )
-            )
-    return int(parsed.timestamp())
+            ) from exc
+    return timestamp
 
 
 def todo_to_dict(item: TodoReminder, timezone: ZoneInfo) -> dict[str, Any]:
@@ -407,6 +413,7 @@ def todo_to_dict(item: TodoReminder, timezone: ZoneInfo) -> dict[str, Any]:
 
     return {
         "number": item.todo_no,
+        "history_id": item.history_id,
         "title": item.title,
         "content": item.content,
         "status": item.status,
@@ -471,7 +478,8 @@ def format_inline(item: TodoReminder) -> str:
         形如 `[1] 标题` 的展示文本。
     """
 
-    return f"[{item.todo_no}] {truncate(item.title, 80)}"
+    history = f" | 历史 ID: {item.history_id}" if item.status != STATUS_OPEN else ""
+    return f"[{item.todo_no}] {truncate(item.title, 80)}{history}"
 
 
 def format_time(timestamp: int | None, timezone: ZoneInfo) -> str:

@@ -6,6 +6,7 @@ llm_model: "deepseek-v4-flash"
 llm_timeout_seconds: 30
 timezone: "Asia/Shanghai"
 reminder_check_interval: "60s"
-max_pending_todos_per_scope: 100
+max_pending_todos_per_user: 100
 max_due_reminders_per_check: 20
 reject_past_reminder: true
+permanent_delete_confirmation_ttl_seconds: 300

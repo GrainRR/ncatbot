@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
-from ..todo_store import STATUS_OPEN, TodoStore
+from ..todo_store import ReminderTimeValidationError, STATUS_OPEN, TodoStore
 from .common import (
     TodoToolContext,
     ToolResult,
@@ -57,11 +57,28 @@ def merge_todos(
         "remind_at": min(remind_values) if remind_values else None,
         "due_at": max(due_values) if due_values else None,
     }
-    merged = store.update_fields(items[0].id, updates, STATUS_OPEN)
+    try:
+        merged = store.merge_open_todos(
+            [item.id for item in items],
+            context.user_id,
+            updates,
+            context.now,
+            context.reject_past_reminder,
+        )
+    except ReminderTimeValidationError as exc:
+        return ToolResult(
+            ok=False,
+            status="error",
+            message="提醒时间必须晚于当前时间，待办没有写入",
+            data={"code": "remind_at_not_future", "remind_at": exc.remind_at, "now": exc.now},
+        )
     if merged is None:
-        return status_changed_result(store, context, items[0].todo_no, "合并")
-    for item in items[1:]:
-        store.cancel(item.id)
+        return ToolResult(
+            ok=False,
+            status="error",
+            message="待办状态或归属已变化，批量合并未执行，数据没有部分修改",
+            data={"numbers": numbers, "atomic": True},
+        )
     return ToolResult(
         ok=True,
         status="success",

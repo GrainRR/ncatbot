@@ -12,12 +12,15 @@ from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 from ..todo_store import (
+    ReminderTimeValidationError,
     STATUS_DELETED,
     STATUS_DONE,
     STATUS_OPEN,
+    TodoConfirmationError,
     TodoReminder,
     TodoReminderDraft,
     TodoStore,
+    validate_remind_at,
 )
 
 
@@ -61,6 +64,7 @@ class TodoToolContext:
     timezone: ZoneInfo
     max_pending: int = 100
     reject_past_reminder: bool = True
+    permanent_delete_confirmation_ttl_seconds: int = 300
     last_todo_no: int | None = None
     reminder_mode: str = "concise"
     user_text: str = ""
@@ -283,14 +287,6 @@ class TodoToolExecutor:
         if not reminder_text:
             reminder_text = _fallback_reminder_text(title)
 
-        if self.context.reject_past_reminder and reminder_at is not None:
-            if reminder_at <= self.context.now:
-                return ToolResult(
-                    ok=False,
-                    status="error",
-                    message="提醒时间已经过去，待办没有写入",
-                    data={},
-                )
         if self.store.count_pending(
             self.context.scope,
             self.context.group_id,
@@ -314,13 +310,17 @@ class TodoToolExecutor:
                 llm_json={"tool": "create_todo", "arguments": args},
             )
         ]
-        created = self.store.create_many(
-            self.context.scope,
-            self.context.group_id,
-            self.context.user_id,
-            drafts,
-            self.context.now,
-        )[0]
+        try:
+            created = self.store.create_many(
+                self.context.scope,
+                self.context.group_id,
+                self.context.user_id,
+                drafts,
+                self.context.now,
+                self.context.reject_past_reminder,
+            )[0]
+        except ReminderTimeValidationError as exc:
+            return self._reminder_validation_error(exc)
         return ToolResult(
             ok=True,
             status="success",
@@ -366,7 +366,17 @@ class TodoToolExecutor:
                 data={"number": number},
             )
 
-        updated = self.store.update_fields(item.id, updates, STATUS_OPEN)
+        try:
+            updated = self.store.update_fields(
+                item.id,
+                updates,
+                STATUS_OPEN,
+                self.context.user_id,
+                self.context.now,
+                self.context.reject_past_reminder,
+            )
+        except ReminderTimeValidationError as exc:
+            return self._reminder_validation_error(exc)
         if updated is None:
             return self._status_changed_result(number, "修改")
         return ToolResult(
@@ -413,7 +423,17 @@ class TodoToolExecutor:
                 data={"number": number},
             )
 
-        updated = self.store.update_fields(item.id, updates, STATUS_OPEN)
+        try:
+            updated = self.store.update_fields(
+                item.id,
+                updates,
+                STATUS_OPEN,
+                self.context.user_id,
+                self.context.now,
+                self.context.reject_past_reminder,
+            )
+        except ReminderTimeValidationError as exc:
+            return self._reminder_validation_error(exc)
         if updated is None:
             return self._status_changed_result(number, "调整时间")
         direction_text = "提前" if direction == "earlier" else "推迟"
@@ -446,12 +466,11 @@ class TodoToolExecutor:
 
         numbers = self._numbers_from_args(args)
         items = [self._resolve_todo(number, (STATUS_OPEN,), "完成") for number in numbers]
-        completed: list[TodoReminder] = []
-        for item in items:
-            updated = self.store.complete(item.id)
-            if updated is None:
-                return self._status_changed_result(item.todo_no, "完成")
-            completed.append(updated)
+        completed = self.store.complete_many(
+            [item.id for item in items], self.context.user_id
+        )
+        if completed is None:
+            return self._batch_state_changed_result("完成", "numbers", numbers)
         return ToolResult(
             ok=True,
             status="success",
@@ -471,7 +490,7 @@ class TodoToolExecutor:
 
         number = self._number_from_args(args)
         item = self._resolve_todo(number, (STATUS_OPEN,), "取消")
-        canceled = self.store.cancel(item.id)
+        canceled = self.store.cancel(item.id, self.context.user_id)
         if canceled is None:
             return self._status_changed_result(number, "取消")
         return ToolResult(
@@ -485,24 +504,28 @@ class TodoToolExecutor:
         """恢复一个或多个已完成或已取消待办。
 
         Args:
-            args: 已通过 schema 校验的工具参数，包含 `numbers`、`number`
-                或 `reference`。
+            args: 已通过 schema 校验的工具参数，包含一个或多个稳定历史 ID。
 
         Returns:
             已恢复待办列表；目标不存在或状态非法时返回错误结果。
         """
 
-        numbers = self._numbers_from_args(args)
+        history_ids = self._history_ids_from_args(args)
         items = [
-            self._resolve_todo(number, (STATUS_DONE, STATUS_DELETED), "恢复")
-            for number in numbers
+            self._resolve_history_todo(history_id, (STATUS_DONE, STATUS_DELETED), "恢复")
+            for history_id in history_ids
         ]
-        restored: list[TodoReminder] = []
-        for item in items:
-            updated = self.store.restore(item.id)
-            if updated is None:
-                return self._status_changed_result(item.todo_no, "恢复")
-            restored.append(updated)
+        try:
+            restored = self.store.restore_many(
+                [item.id for item in items],
+                self.context.user_id,
+                self.context.now,
+                self.context.reject_past_reminder,
+            )
+        except ReminderTimeValidationError as exc:
+            return self._reminder_validation_error(exc)
+        if restored is None:
+            return self._batch_state_changed_result("恢复", "history_ids", history_ids)
         return ToolResult(
             ok=True,
             status="success",
@@ -514,31 +537,55 @@ class TodoToolExecutor:
         """永久删除一个或多个待办。
 
         Args:
-            args: 已通过 schema 校验的工具参数，包含目标编号和 `confirmed`。
+            args: 已通过 schema 校验的工具参数，包含稳定历史 ID 与可选确认令牌。
 
         Returns:
-            未确认时返回确认结果且不删库；确认后返回永久删除结果。
+            首次请求只创建确认令牌；只有持有匹配令牌的后续请求才会删除。
         """
 
-        numbers = self._numbers_from_args(args)
-        items = [self._resolve_todo(number, None, "永久删除") for number in numbers]
-        if args.get("confirmed") is not True:
+        history_ids = self._history_ids_from_args(args)
+        token = _clean_optional_text(args.get("confirmation_token"))
+        if token is None:
+            items = [
+                self._resolve_history_todo(history_id, None, "永久删除")
+                for history_id in history_ids
+            ]
+            confirmation = self.store.create_permanent_delete_confirmation(
+                self.context.user_id,
+                items,
+                self.context.now,
+                self.context.permanent_delete_confirmation_ttl_seconds,
+            )
             return ToolResult(
                 ok=False,
                 status="confirm",
                 message=(
-                    "永久删除不可恢复。请确认是否永久删除："
+                    "永久删除不可恢复。请在令牌有效期内使用此确认令牌再次确认："
+                    f"{confirmation.token}\n目标："
                     + "、".join(self._format_inline(item) for item in items)
                 ),
-                data={"items": [self._todo_to_dict(item) for item in items], "deleted": False},
+                data={
+                    "items": [self._todo_to_dict(item) for item in items],
+                    "deleted": False,
+                    "confirmation_token": confirmation.token,
+                    "expires_at": confirmation.expires_at,
+                    "history_ids": list(confirmation.target_history_ids),
+                },
             )
-        for item in items:
-            self.store.delete_permanent(item.id)
+        try:
+            deleted = self.store.permanently_delete_confirmed(
+                token,
+                self.context.user_id,
+                history_ids,
+                self.context.now,
+            )
+        except TodoConfirmationError as exc:
+            return self._confirmation_error(exc)
         return ToolResult(
             ok=True,
             status="success",
-            message="已永久删除待办：" + "、".join(f"[{item.todo_no}] {item.title}" for item in items),
-            data={"items": [self._todo_to_dict(item) for item in items], "deleted": True},
+            message="已永久删除待办：" + "、".join(self._format_inline(item) for item in deleted),
+            data={"items": [self._todo_to_dict(item) for item in deleted], "deleted": True},
         )
 
     def merge_todos(self, args: dict[str, Any]) -> ToolResult:
@@ -573,11 +620,18 @@ class TodoToolExecutor:
             "remind_at": min(remind_values) if remind_values else None,
             "due_at": max(due_values) if due_values else None,
         }
-        merged = self.store.update_fields(items[0].id, updates, STATUS_OPEN)
+        try:
+            merged = self.store.merge_open_todos(
+                [item.id for item in items],
+                self.context.user_id,
+                updates,
+                self.context.now,
+                self.context.reject_past_reminder,
+            )
+        except ReminderTimeValidationError as exc:
+            return self._reminder_validation_error(exc)
         if merged is None:
-            return self._status_changed_result(items[0].todo_no, "合并")
-        for item in items[1:]:
-            self.store.cancel(item.id)
+            return self._batch_state_changed_result("合并", "numbers", numbers)
         return ToolResult(
             ok=True,
             status="success",
@@ -604,6 +658,26 @@ class TodoToolExecutor:
             if unique_numbers:
                 return unique_numbers
         return [self._number_from_args(args)]
+
+    def _history_ids_from_args(self, args: dict[str, Any]) -> list[str]:
+        """从工具参数中取得一个或多个稳定、用户可见的历史 ID。"""
+
+        values = args.get("history_ids")
+        if values:
+            history_ids = list(dict.fromkeys(str(value).strip() for value in values if str(value).strip()))
+            if history_ids:
+                return history_ids
+        history_id = _clean_optional_text(args.get("history_id"))
+        if history_id:
+            return [history_id]
+        raise ToolExecutionStop(
+            ToolResult(
+                ok=False,
+                status="clarify",
+                message="请提供待办列表中显示的历史 ID（例如 H-...）",
+                data={},
+            )
+        )
 
     def _number_from_args(self, args: dict[str, Any]) -> int:
         """从工具参数中解析单个用户可见编号。
@@ -693,6 +767,36 @@ class TodoToolExecutor:
             )
         )
 
+    def _resolve_history_todo(
+        self,
+        history_id: str,
+        statuses: tuple[str, ...] | None,
+        action: str,
+    ) -> TodoReminder:
+        """按稳定历史 ID 解析历史待办，避免复用展示序号导致误操作。"""
+
+        item = self.store.find_by_history_id(self.context.user_id, history_id, statuses)
+        if item is not None:
+            return item
+        existing = self.store.find_by_history_id(self.context.user_id, history_id, None)
+        if existing is not None:
+            raise ToolExecutionStop(
+                ToolResult(
+                    ok=False,
+                    status="error",
+                    message=f"历史 ID {history_id} 的待办当前状态是{_status_label(existing.status)}，不能{action}",
+                    data={"history_id": history_id, "status": existing.status},
+                )
+            )
+        raise ToolExecutionStop(
+            ToolResult(
+                ok=False,
+                status="error",
+                message=f"找不到历史 ID {history_id} 对应的待办，请先查看待办列表",
+                data={"history_id": history_id},
+            )
+        )
+
     def _status_changed_result(self, number: int, action: str) -> ToolResult:
         """生成并发状态变化后的失败结果。
 
@@ -723,6 +827,45 @@ class TodoToolExecutor:
             status="error",
             message=f"找不到第 {number} 条待办，请先查看待办列表确认编号",
             data={"number": number},
+        )
+
+    @staticmethod
+    def _batch_state_changed_result(action: str, target_field: str, targets: list[Any]) -> ToolResult:
+        """批量事务复核失败时返回统一错误，明确说明没有任何部分写入。"""
+
+        return ToolResult(
+            ok=False,
+            status="error",
+            message=f"待办状态或归属已变化，批量{action}未执行，数据没有部分修改",
+            data={target_field: targets, "atomic": True},
+        )
+
+    @staticmethod
+    def _reminder_validation_error(exc: ReminderTimeValidationError) -> ToolResult:
+        """把统一的提醒时间校验错误转换为工具层结构化结果。"""
+
+        return ToolResult(
+            ok=False,
+            status="error",
+            message="提醒时间必须晚于当前时间，待办没有写入",
+            data={"code": "remind_at_not_future", "remind_at": exc.remind_at, "now": exc.now},
+        )
+
+    @staticmethod
+    def _confirmation_error(exc: TodoConfirmationError) -> ToolResult:
+        """返回不泄露内部数据库信息的永久删除确认失败结果。"""
+
+        messages = {
+            "confirmation_invalid": "永久删除确认令牌无效，待办没有删除",
+            "confirmation_expired": "永久删除确认令牌已过期，待办没有删除",
+            "confirmation_target_mismatch": "确认目标与首次请求不一致，待办没有删除",
+            "confirmation_target_changed": "确认期间待办状态已变化，待办没有删除",
+        }
+        return ToolResult(
+            ok=False,
+            status="error",
+            message=messages.get(exc.code, "永久删除确认失败，待办没有删除"),
+            data={"code": exc.code, **exc.data},
         )
 
     def _shift_fields(self, item: TodoReminder, field: str) -> list[str]:
@@ -814,17 +957,17 @@ class TodoToolExecutor:
         if text is None:
             return None
         parsed = _parse_local_datetime(text, self.context.timezone)
-        if field_name == "reminder_at" and self.context.reject_past_reminder:
-            if int(parsed.timestamp()) <= self.context.now:
-                raise ToolExecutionStop(
-                    ToolResult(
-                        ok=False,
-                        status="error",
-                        message="提醒时间已经过去，待办没有写入",
-                        data={"field": field_name, "value": text},
-                    )
+        timestamp = int(parsed.timestamp())
+        if field_name == "reminder_at":
+            try:
+                validate_remind_at(
+                    timestamp,
+                    self.context.now,
+                    self.context.reject_past_reminder,
                 )
-        return int(parsed.timestamp())
+            except ReminderTimeValidationError as exc:
+                raise ToolExecutionStop(self._reminder_validation_error(exc)) from exc
+        return timestamp
 
     def _todo_to_dict(self, item: TodoReminder) -> dict[str, Any]:
         """把待办记录转换为工具结果中的结构化数据。
@@ -833,11 +976,12 @@ class TodoToolExecutor:
             item: 待办记录。
 
         Returns:
-            只暴露用户可见编号和业务字段的字典，不包含数据库内部 ID。
+            只暴露用户可见编号、稳定历史 ID 和业务字段，不包含数据库内部 ID。
         """
 
         return {
             "number": item.todo_no,
+            "history_id": item.history_id,
             "title": item.title,
             "content": item.content,
             "status": item.status,
@@ -897,7 +1041,8 @@ class TodoToolExecutor:
             形如 `[1] 标题` 的展示文本。
         """
 
-        return f"[{item.todo_no}] {_truncate(item.title, 80)}"
+        history = f" | 历史 ID: {item.history_id}" if item.status != STATUS_OPEN else ""
+        return f"[{item.todo_no}] {_truncate(item.title, 80)}{history}"
 
     def _format_time(self, timestamp: int | None) -> str:
         """按工具上下文时区格式化时间戳。
@@ -1019,18 +1164,18 @@ def _build_tool_specs(executor: TodoToolExecutor) -> dict[str, ToolSpec]:
         ),
         "restore_todos": ToolSpec(
             "restore_todos",
-            "恢复一个或多个已完成或已取消待办。",
-            _numbers_schema(required=[]),
+            "恢复一个或多个已完成或已取消待办。必须传列表中显示的稳定 history_id，不能使用待办序号。",
+            _history_targets_schema(),
             executor.restore_todos,
         ),
         "delete_todos": ToolSpec(
             "delete_todos",
-            "永久删除一个或多个待办。默认必须确认，confirmed 不为 true 时不能执行删除。",
+            "永久删除一个或多个待办。必须传稳定 history_id；首次调用只生成确认令牌。confirmed 参数会被忽略，后续删除必须提供 confirmation_token 和完全相同的 history_id。",
             _object_schema(
                 {
-                    "numbers": {"type": "array", "items": {"type": "integer", "minimum": 1}, "minItems": 1},
-                    "number": {"type": ["integer", "null"], "minimum": 1},
-                    "reference": {"type": ["string", "null"]},
+                    "history_ids": {"type": "array", "items": {"type": "string", "minLength": 1}, "minItems": 1},
+                    "history_id": {"type": ["string", "null"], "minLength": 1},
+                    "confirmation_token": {"type": ["string", "null"], "minLength": 1},
                     "confirmed": {"type": "boolean"},
                 },
                 required=[],
@@ -1088,6 +1233,22 @@ def _numbers_schema(required: list[str]) -> dict[str, Any]:
             "reference": {"type": ["string", "null"]},
         },
         required=required,
+    )
+
+
+def _history_targets_schema() -> dict[str, Any]:
+    """构建只能以稳定历史 ID 指定目标的 schema。"""
+
+    return _object_schema(
+        {
+            "history_ids": {
+                "type": "array",
+                "items": {"type": "string", "minLength": 1},
+                "minItems": 1,
+            },
+            "history_id": {"type": ["string", "null"], "minLength": 1},
+        },
+        required=[],
     )
 
 

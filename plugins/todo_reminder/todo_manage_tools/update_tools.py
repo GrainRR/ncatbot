@@ -67,7 +67,14 @@ def edit_todo(
             data={"number": number},
         )
 
-    updated = store.update_fields(item.id, updates, STATUS_OPEN)
+    updated = store.update_fields(
+        item.id,
+        updates,
+        STATUS_OPEN,
+        context.user_id,
+        context.now,
+        context.reject_past_reminder,
+    )
     if updated is None:
         return status_changed_result(store, context, number, "修改")
     return ToolResult(
@@ -121,7 +128,14 @@ def shift_todo_time(
             data={"number": number},
         )
 
-    updated = store.update_fields(item.id, updates, STATUS_OPEN)
+    updated = store.update_fields(
+        item.id,
+        updates,
+        STATUS_OPEN,
+        context.user_id,
+        context.now,
+        context.reject_past_reminder,
+    )
     if updated is None:
         return status_changed_result(store, context, number, "调整时间")
     direction_text = "提前" if direction == "earlier" else "推迟"
