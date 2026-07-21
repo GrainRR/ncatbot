@@ -35,7 +35,22 @@ class TodoToolExecutor:
         return openai_tool_definitions()
 
     def execute(self, tool_name: str, args: dict[str, Any]) -> ToolResult:
-        """校验并调度单个白名单工具。"""
+        """校验并调度单个白名单工具，统一转换预期异常。
+
+        Args:
+            tool_name: 必须存在于唯一注册表中的工具名；不允许通过模块路径或
+                任意可调用对象绕过白名单。
+            args: LLM 提供的 JSON 对象。先依据注册表中的 Schema 校验，处理器
+                只会收到已通过类型、枚举、必填字段和额外字段检查的参数。
+
+        Returns:
+            处理器的真实结果，或未知工具、参数错误、确认失败、提醒时间失败及
+            SQLite 失败对应的结构化 `ToolResult`。SQLite 失败结果只在事务回滚后返回。
+
+        Raises:
+            无。所有预期的工具、业务和数据库异常都会在此边界转换为结果；未预期
+            的编程错误继续抛出，以避免掩盖缺陷。
+        """
 
         spec = TOOL_SPECS_BY_NAME.get(tool_name)
         if spec is None:

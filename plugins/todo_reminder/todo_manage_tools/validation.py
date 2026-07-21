@@ -68,7 +68,18 @@ def history_targets_schema() -> dict[str, Any]:
 
 
 def validate_json_schema(value: Any, schema: dict[str, Any], path: str = "$") -> None:
-    """校验项目所需的最小 JSON Schema 子集。"""
+    """递归校验工具参数使用的最小 JSON Schema 子集。
+
+    Args:
+        value: 待校验的 LLM 参数或其嵌套值。
+        schema: 注册表声明的 Schema，支持对象、数组、联合类型、枚举、必填项、
+            `additionalProperties`、最小值和最小长度。
+        path: 当前值的 JSONPath 风格位置，用于返回可定位的错误消息。
+
+    Raises:
+        ToolValidationError: 类型、枚举、必填字段、额外字段、数组大小或下界约束
+            任一不满足时。
+    """
 
     expected_type = schema.get("type")
     if expected_type is not None:
@@ -133,7 +144,20 @@ def clean_required_text(value: Any, field_name: str) -> str:
 
 
 def parse_optional_time(value: Any, field_name: str, context: TodoToolContext) -> int | None:
-    """解析本地时间并通过唯一的提醒时间有效性校验。"""
+    """解析可选时间文本，并对提醒时间执行唯一业务校验入口。
+
+    Args:
+        value: LLM 提供的 ISO 或本地时间文本；空、`null`、`none`、`无` 与
+            `未设置` 都视为未设置。
+        field_name: 工具字段名；仅 `reminder_at` 需要校验严格晚于当前时间。
+        context: 含可信时区、当前时间及 `reject_past_reminder` 开关的上下文。
+
+    Returns:
+        Unix 秒级时间戳，或未设置时的 `None`。
+
+    Raises:
+        ToolExecutionStop: 文本格式非法或提醒时间不满足未来时间规则时。
+    """
 
     text = clean_optional_text(value)
     if text is None:

@@ -23,6 +23,16 @@ OPERATION_PERMANENT_DELETE = "permanent_delete"
 DELETION_REASON_USER_CANCEL = "user_cancel"
 DELETION_REASON_REMINDER_SENT = "reminder_sent"
 
+# A proposal is deliberately persisted instead of being held in the plugin
+# process.  A restart must not turn an old "yes" into an unverified write.
+PROPOSAL_NEW = "NEW"
+PROPOSAL_PENDING = "PENDING_PROPOSAL"
+PROPOSAL_ACCEPTED = "ACCEPTED"
+PROPOSAL_REJECTED = "REJECTED"
+PROPOSAL_REPLACED = "REPLACED"
+PROPOSAL_EXPIRED = "EXPIRED"
+PROPOSAL_EXECUTED = "EXECUTED"
+
 
 class ReminderTimeValidationError(ValueError):
     """提醒时间不符合当前业务规则。"""
@@ -104,6 +114,47 @@ class PermanentDeleteConfirmation:
     expires_at: int
 
 
+@dataclass(frozen=True)
+class TodoProposalCandidate:
+    """A validated-but-not-yet-executable tool invocation.
+
+    ``target_snapshots`` only contains user-visible stable history IDs and
+    their revision/status snapshots.  It never contains the SQLite primary
+    key, so it is safe to persist and to use as the execution gate input.
+    """
+
+    option_id: int
+    tool_name: str
+    arguments: dict[str, Any]
+    target_snapshots: tuple[dict[str, Any], ...] = ()
+
+
+@dataclass(frozen=True)
+class TodoProposal:
+    """Persistent conversational proposal state.
+
+    A proposal binds an LLM suggestion to exactly one user and one message
+    scope.  Its state/version and optional accepted event ID provide the
+    compare-and-set boundary that makes repeated confirmations harmless.
+    """
+
+    token: str
+    user_id: str
+    scope: str
+    group_id: str | None
+    created_at: int
+    expires_at: int
+    status: str
+    state_version: int
+    source_text: str
+    question_text: str
+    candidates: tuple[TodoProposalCandidate, ...]
+    question_rounds: int
+    accepted_option_id: int | None = None
+    accepted_event_id: str | None = None
+    execution_result: str | None = None
+
+
 class TodoStore:
     """负责待办提醒的 SQLite 建表、查询和状态更新。"""
 
@@ -164,6 +215,25 @@ class TodoStore:
                     target_snapshot TEXT NOT NULL,
                     expires_at INTEGER NOT NULL,
                     created_at INTEGER NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS todo_proposals (
+                    token TEXT PRIMARY KEY,
+                    user_id TEXT NOT NULL,
+                    scope TEXT NOT NULL,
+                    group_id TEXT,
+                    created_at INTEGER NOT NULL,
+                    expires_at INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    state_version INTEGER NOT NULL DEFAULT 1,
+                    source_text TEXT NOT NULL,
+                    question_text TEXT NOT NULL DEFAULT '',
+                    candidates_json TEXT NOT NULL DEFAULT '[]',
+                    question_rounds INTEGER NOT NULL DEFAULT 0,
+                    accepted_option_id INTEGER,
+                    accepted_event_id TEXT,
+                    execution_result TEXT,
+                    executed_at INTEGER
                 );
                 """
             )
@@ -1129,6 +1199,291 @@ class TodoStore:
                 (user_id, mode, int(now)),
             )
 
+    def create_proposal(
+        self,
+        user_id: str,
+        scope: str,
+        group_id: str | None,
+        source_text: str,
+        question_text: str,
+        candidates: Sequence[TodoProposalCandidate],
+        now: int,
+        ttl_seconds: int,
+        question_rounds: int = 0,
+    ) -> TodoProposal:
+        """Create the sole active proposal for one user/session.
+
+        Side effects and state transition:
+            Any previous pending proposal in exactly the same private chat or
+            group session becomes ``REPLACED`` atomically, then a fresh
+            ``PENDING_PROPOSAL`` row is inserted.  The proposal payload is
+            server generated; user messages never supply tool arguments.
+
+        Concurrency/security:
+            The transaction prevents two concurrent incoming messages from
+            leaving two active choices in one session.  ``group_id IS ?`` is
+            used intentionally so a private chat is not conflated with a
+            group whose ID happens to be an empty string.
+        """
+
+        token = f"proposal_{secrets.token_urlsafe(24)}"
+        created_at = int(now)
+        expires_at = created_at + max(1, int(ttl_seconds))
+        serialized_candidates = _serialize_proposal_candidates(candidates)
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                """
+                UPDATE todo_proposals
+                SET status = ?, state_version = state_version + 1
+                WHERE user_id = ?
+                  AND scope = ?
+                  AND group_id IS ?
+                  AND status = ?
+                """,
+                (PROPOSAL_REPLACED, str(user_id), str(scope), group_id, PROPOSAL_PENDING),
+            )
+            conn.execute(
+                """
+                INSERT INTO todo_proposals (
+                    token, user_id, scope, group_id, created_at, expires_at,
+                    status, state_version, source_text, question_text,
+                    candidates_json, question_rounds
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)
+                """,
+                (
+                    token,
+                    str(user_id),
+                    str(scope),
+                    group_id,
+                    created_at,
+                    expires_at,
+                    PROPOSAL_PENDING,
+                    str(source_text).strip(),
+                    str(question_text).strip(),
+                    serialized_candidates,
+                    max(0, int(question_rounds)),
+                ),
+            )
+            row = conn.execute("SELECT * FROM todo_proposals WHERE token = ?", (token,)).fetchone()
+        if row is None:
+            raise RuntimeError("proposal disappeared after insert")
+        return _row_to_proposal(row)
+
+    def get_active_proposal(
+        self,
+        user_id: str,
+        scope: str,
+        group_id: str | None,
+        now: int,
+    ) -> TodoProposal | None:
+        """Return one unexpired pending proposal bound to the exact session.
+
+        Expiration is enforced during every lookup rather than by a best-effort
+        timer.  This is the first execution safety boundary after a restart.
+        """
+
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE todo_proposals
+                SET status = ?, state_version = state_version + 1
+                WHERE user_id = ? AND scope = ? AND group_id IS ?
+                  AND status = ? AND expires_at <= ?
+                """,
+                (PROPOSAL_EXPIRED, str(user_id), str(scope), group_id, PROPOSAL_PENDING, int(now)),
+            )
+            row = conn.execute(
+                """
+                SELECT * FROM todo_proposals
+                WHERE user_id = ? AND scope = ? AND group_id IS ?
+                  AND status = ? AND expires_at > ?
+                ORDER BY created_at DESC, token DESC
+                LIMIT 1
+                """,
+                (str(user_id), str(scope), group_id, PROPOSAL_PENDING, int(now)),
+            ).fetchone()
+        return _row_to_proposal(row) if row is not None else None
+
+    def reject_proposal(
+        self,
+        token: str,
+        user_id: str,
+        scope: str,
+        group_id: str | None,
+        now: int,
+    ) -> str:
+        """Close a pending proposal as rejected, without executing anything.
+
+        Returns a compact outcome code.  Session matching is part of the SQL
+        predicate, so another user or group cannot reject a proposal by
+        guessing a token.
+        """
+
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM todo_proposals WHERE token = ?", (str(token),)).fetchone()
+            if row is None:
+                return "missing"
+            proposal = _row_to_proposal(row)
+            if not _proposal_matches(proposal, user_id, scope, group_id):
+                return "mismatch"
+            if proposal.status != PROPOSAL_PENDING:
+                return "closed"
+            if proposal.expires_at <= int(now):
+                conn.execute(
+                    "UPDATE todo_proposals SET status = ?, state_version = state_version + 1 WHERE token = ?",
+                    (PROPOSAL_EXPIRED, proposal.token),
+                )
+                return "expired"
+            cursor = conn.execute(
+                """
+                UPDATE todo_proposals
+                SET status = ?, state_version = state_version + 1
+                WHERE token = ? AND status = ? AND state_version = ?
+                """,
+                (PROPOSAL_REJECTED, proposal.token, PROPOSAL_PENDING, proposal.state_version),
+            )
+        return "rejected" if cursor.rowcount == 1 else "closed"
+
+    def replace_proposal(
+        self,
+        token: str,
+        user_id: str,
+        scope: str,
+        group_id: str | None,
+        now: int,
+    ) -> str:
+        """Close a pending proposal because a newer complete request arrived.
+
+        A fresh direct command must win over an earlier conversational choice;
+        otherwise a later bare "yes" could apply to the wrong user intent.
+        The exact session predicate also enforces group-chat isolation.
+        """
+
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM todo_proposals WHERE token = ?", (str(token),)).fetchone()
+            if row is None:
+                return "missing"
+            proposal = _row_to_proposal(row)
+            if not _proposal_matches(proposal, user_id, scope, group_id):
+                return "mismatch"
+            if proposal.status != PROPOSAL_PENDING:
+                return "closed"
+            status = PROPOSAL_EXPIRED if proposal.expires_at <= int(now) else PROPOSAL_REPLACED
+            cursor = conn.execute(
+                """
+                UPDATE todo_proposals
+                SET status = ?, state_version = state_version + 1
+                WHERE token = ? AND status = ? AND state_version = ?
+                """,
+                (status, proposal.token, PROPOSAL_PENDING, proposal.state_version),
+            )
+        return "replaced" if cursor.rowcount == 1 and status == PROPOSAL_REPLACED else (
+            "expired" if cursor.rowcount == 1 else "closed"
+        )
+
+    def claim_proposal_for_execution(
+        self,
+        token: str,
+        option_id: int,
+        user_id: str,
+        scope: str,
+        group_id: str | None,
+        event_id: str | None,
+        now: int,
+    ) -> tuple[str, TodoProposal | None, TodoProposalCandidate | None]:
+        """Atomically change a selected proposal from pending to accepted.
+
+        This is the idempotency gate before the real executor.  Only the
+        first matching event can move ``PENDING_PROPOSAL`` to ``ACCEPTED``;
+        repeated delivery of the same event returns ``duplicate`` and must
+        never call a tool again.  It does *not* execute the candidate.
+        """
+
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM todo_proposals WHERE token = ?", (str(token),)).fetchone()
+            if row is None:
+                return "missing", None, None
+            proposal = _row_to_proposal(row)
+            if not _proposal_matches(proposal, user_id, scope, group_id):
+                return "mismatch", proposal, None
+            candidate = next((item for item in proposal.candidates if item.option_id == int(option_id)), None)
+            if candidate is None:
+                return "invalid_option", proposal, None
+            if proposal.status in {PROPOSAL_ACCEPTED, PROPOSAL_EXECUTED}:
+                if event_id and proposal.accepted_event_id == str(event_id):
+                    return "duplicate", proposal, candidate
+                return "closed", proposal, None
+            if proposal.status != PROPOSAL_PENDING:
+                return "closed", proposal, None
+            if proposal.expires_at <= int(now):
+                conn.execute(
+                    "UPDATE todo_proposals SET status = ?, state_version = state_version + 1 WHERE token = ?",
+                    (PROPOSAL_EXPIRED, proposal.token),
+                )
+                return "expired", proposal, None
+            cursor = conn.execute(
+                """
+                UPDATE todo_proposals
+                SET status = ?, state_version = state_version + 1,
+                    accepted_option_id = ?, accepted_event_id = ?
+                WHERE token = ? AND status = ? AND state_version = ?
+                """,
+                (
+                    PROPOSAL_ACCEPTED,
+                    int(option_id),
+                    str(event_id) if event_id else None,
+                    proposal.token,
+                    PROPOSAL_PENDING,
+                    proposal.state_version,
+                ),
+            )
+            if cursor.rowcount != 1:
+                return "closed", proposal, None
+            accepted_row = conn.execute("SELECT * FROM todo_proposals WHERE token = ?", (proposal.token,)).fetchone()
+        return "accepted", _row_to_proposal(accepted_row), candidate
+
+    def complete_proposal_execution(self, token: str, result_message: str, now: int) -> None:
+        """Make an accepted proposal terminal after exactly one executor call.
+
+        Even an executor failure is recorded as terminal by the router.  This
+        prevents a duplicate "yes" from turning a failed request into a
+        second write attempt.
+        """
+
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE todo_proposals
+                SET status = ?, state_version = state_version + 1,
+                    execution_result = ?, executed_at = ?
+                WHERE token = ? AND status = ?
+                """,
+                (PROPOSAL_EXECUTED, str(result_message), int(now), str(token), PROPOSAL_ACCEPTED),
+            )
+
+    def expire_proposals(self, now: int) -> int:
+        """Expire pending proposals for scheduled cleanup and observability.
+
+        Correctness does not depend on this method because lookups and the
+        execution claim also check expiry.  It simply makes stale state stop
+        appearing as active promptly.
+        """
+
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                UPDATE todo_proposals
+                SET status = ?, state_version = state_version + 1
+                WHERE status = ? AND expires_at <= ?
+                """,
+                (PROPOSAL_EXPIRED, PROPOSAL_PENDING, int(now)),
+            )
+        return int(cursor.rowcount)
+
     def _transition(
         self,
         todo_id: int,
@@ -1470,6 +1825,12 @@ class TodoStore:
 
             CREATE INDEX IF NOT EXISTS idx_todo_confirmation_expiry
             ON todo_operation_confirmations(expires_at);
+
+            CREATE INDEX IF NOT EXISTS idx_todo_proposal_active
+            ON todo_proposals(user_id, scope, group_id, status, expires_at);
+
+            CREATE INDEX IF NOT EXISTS idx_todo_proposal_expiry
+            ON todo_proposals(expires_at, status);
             """
         )
 
@@ -1721,6 +2082,89 @@ def _row_to_todo(row: sqlite3.Row) -> TodoReminder:
         reminded_at=_optional_int(row["reminded_at"]),
         deletion_reason=row["deletion_reason"],
         llm_json=row["llm_json"],
+    )
+
+
+def _serialize_proposal_candidates(candidates: Sequence[TodoProposalCandidate]) -> str:
+    """Serialize server-validated proposal candidates for SQLite storage."""
+
+    payload = [
+        {
+            "option_id": int(candidate.option_id),
+            "tool_name": str(candidate.tool_name),
+            "arguments": candidate.arguments,
+            "target_snapshots": list(candidate.target_snapshots),
+        }
+        for candidate in candidates
+    ]
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+
+def _row_to_proposal(row: sqlite3.Row) -> TodoProposal:
+    """Decode a proposal row defensively; malformed candidates are unusable.
+
+    A malformed row must never become an executable fallback.  Dropping a bad
+    candidate merely forces the user to make a new request, which is safer
+    than trying to repair LLM-originated arguments on the execution path.
+    """
+
+    try:
+        raw_candidates = json.loads(str(row["candidates_json"] or "[]"))
+    except (TypeError, ValueError):
+        raw_candidates = []
+    candidates: list[TodoProposalCandidate] = []
+    if isinstance(raw_candidates, list):
+        for raw in raw_candidates:
+            if not isinstance(raw, dict):
+                continue
+            option_id = raw.get("option_id")
+            tool_name = raw.get("tool_name")
+            arguments = raw.get("arguments")
+            snapshots = raw.get("target_snapshots", [])
+            if (
+                not isinstance(option_id, int)
+                or option_id < 1
+                or not isinstance(tool_name, str)
+                or not tool_name
+                or not isinstance(arguments, dict)
+                or not isinstance(snapshots, list)
+            ):
+                continue
+            safe_snapshots = tuple(item for item in snapshots if isinstance(item, dict))
+            candidates.append(
+                TodoProposalCandidate(option_id, tool_name, arguments, safe_snapshots)
+            )
+    return TodoProposal(
+        token=str(row["token"]),
+        user_id=str(row["user_id"]),
+        scope=str(row["scope"]),
+        group_id=row["group_id"],
+        created_at=int(row["created_at"]),
+        expires_at=int(row["expires_at"]),
+        status=str(row["status"]),
+        state_version=int(row["state_version"]),
+        source_text=str(row["source_text"] or ""),
+        question_text=str(row["question_text"] or ""),
+        candidates=tuple(candidates),
+        question_rounds=int(row["question_rounds"] or 0),
+        accepted_option_id=_optional_int(row["accepted_option_id"]),
+        accepted_event_id=str(row["accepted_event_id"]) if row["accepted_event_id"] else None,
+        execution_result=str(row["execution_result"]) if row["execution_result"] else None,
+    )
+
+
+def _proposal_matches(
+    proposal: TodoProposal,
+    user_id: str,
+    scope: str,
+    group_id: str | None,
+) -> bool:
+    """Check the immutable session binding before a state transition."""
+
+    return (
+        proposal.user_id == str(user_id)
+        and proposal.scope == str(scope)
+        and proposal.group_id == group_id
     )
 
 

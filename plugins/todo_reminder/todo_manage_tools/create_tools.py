@@ -43,6 +43,24 @@ def tool_specs() -> tuple[ToolSpec, ...]:
 
 
 def _create_todo(runtime: ToolRuntime, args: dict[str, Any]) -> ToolResult:
+    """创建一条待办，并在写库前完成模式、容量与时间规则校验。
+
+    Args:
+        runtime: 后端注入的可信存储和会话上下文；LLM 无法指定其中的用户、
+            群组或当前时间。
+        args: 已通过 Schema 校验的创建参数。`title` 必填；`reminder_at`
+            和 `due_at` 为用户时区时间文本；`reminder_text` 在猫娘模式下
+            必须由调用方显式提供。
+
+    Returns:
+        创建成功的待办及用户可读的提醒时间。
+
+    Raises:
+        ToolExecutionStop: 标题为空、猫娘提醒文案缺失或未完成待办达到上限时。
+        ReminderTimeValidationError: 提醒时间不晚于可信上下文的当前时间时，
+            由执行器统一转换为结构化错误。
+    """
+
     context = runtime.context
     title = clean_required_text(args.get("title"), "title")
     content = clean_optional_text(args.get("content"))

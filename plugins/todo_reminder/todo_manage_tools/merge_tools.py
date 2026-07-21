@@ -37,6 +37,21 @@ def tool_specs() -> tuple[ToolSpec, ...]:
 
 
 def _merge_todos(runtime: ToolRuntime, args: dict[str, Any]) -> ToolResult:
+    """原子合并多个未完成待办，保留第一个目标作为合并记录。
+
+    Args:
+        runtime: 可信运行时；用户归属和提醒时间规则只从这里取得。
+        args: 包含至少两个当前未完成编号的 `numbers`，以及可选合并标题。
+            未给标题时按输入顺序拼接原标题。
+
+    Returns:
+        合并后的第一条待办和被合并的编号；任一目标在事务内失效时不写入部分结果。
+
+    Raises:
+        ToolExecutionStop: 去重后目标不足两条时。
+        ReminderTimeValidationError: 合并所得的最早提醒时间不在未来时。
+    """
+
     numbers = numbers_from_args(args, runtime)
     if len(numbers) < 2:
         raise ToolExecutionStop(ToolResult(False, "clarify", "合并待办至少需要两个编号", {"numbers": numbers}))

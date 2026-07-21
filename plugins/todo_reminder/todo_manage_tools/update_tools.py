@@ -62,6 +62,21 @@ def tool_specs() -> tuple[ToolSpec, ...]:
 
 
 def _edit_todo(runtime: ToolRuntime, args: dict[str, Any]) -> ToolResult:
+    """修改一条未完成待办的可编辑字段。
+
+    Args:
+        runtime: 含当前用户、时区、当前时间及存储实例的可信运行时。
+        args: 已通过 Schema 校验的参数。`number`/`reference` 定位未完成待办；
+            `clear_reminder_at` 和 `clear_due_at` 的优先级高于对应时间文本。
+
+    Returns:
+        修改后的待办；并发导致目标状态变化时返回结构化失败结果。
+
+    Raises:
+        ToolExecutionStop: 目标编号缺失、待办非未完成状态，或没有任何可修改字段时。
+        ReminderTimeValidationError: 新提醒时间不在未来时，由执行器统一转换。
+    """
+
     context = runtime.context
     number = number_from_args(args, runtime)
     item = resolve_open_todo(runtime, number, "修改")
@@ -98,6 +113,21 @@ def _edit_todo(runtime: ToolRuntime, args: dict[str, Any]) -> ToolResult:
 
 
 def _shift_todo_time(runtime: ToolRuntime, args: dict[str, Any]) -> ToolResult:
+    """按分钟整体调整一条未完成待办的一个或多个时间字段。
+
+    Args:
+        runtime: 可信运行时；其中 `now` 用于阻止提前后落入过去的提醒时间。
+        args: 已校验的定位、`field`、`direction` 和正整数 `delta_minutes`。
+            `field=auto` 只在待办恰有一个时间字段时可消歧。
+
+    Returns:
+        含实际调整字段和分钟数的成功结果；并发状态变化时返回失败结果。
+
+    Raises:
+        ToolExecutionStop: 目标缺少可调整字段，或 `auto` 无法判断要调整的时间时。
+        ReminderTimeValidationError: 向前调整产生当前时间及以前的提醒时间时。
+    """
+
     context = runtime.context
     number = number_from_args(args, runtime)
     item = resolve_open_todo(runtime, number, "调整时间")
@@ -140,6 +170,19 @@ def _shift_todo_time(runtime: ToolRuntime, args: dict[str, Any]) -> ToolResult:
 
 
 def _shift_fields(item: TodoReminder, field: str) -> list[str]:
+    """将工具层字段选择解析为实际可更新的时间字段。
+
+    Args:
+        item: 已确认处于 `open` 状态的目标待办。
+        field: Schema 限定为 `auto`、`reminder_at`、`due_at` 或 `both` 的字段选择。
+
+    Returns:
+        应写入的字段名列表；`both` 始终保留两个字段，即使其中一个值为空。
+
+    Raises:
+        ToolExecutionStop: 指定字段不存在、待办没有时间，或 `auto` 对双时间待办不明确时。
+    """
+
     if field == "both":
         if item.remind_at is None and item.due_at is None:
             raise _missing_time_field(item)
