@@ -73,7 +73,7 @@ def validate_json_schema(value: Any, schema: dict[str, Any], path: str = "$") ->
     Args:
         value: 待校验的 LLM 参数或其嵌套值。
         schema: 注册表声明的 Schema，支持对象、数组、联合类型、枚举、必填项、
-            `additionalProperties`、最小值和最小长度。
+                additionalProperties、最小值和最小长度。
         path: 当前值的 JSONPath 风格位置，用于返回可定位的错误消息。
 
     Raises:

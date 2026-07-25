@@ -1,8 +1,23 @@
+# OpenAI 兼容 API 的基础地址，插件会自动追加 /chat/completions.
 llm_api_base: "https://api.deepseek.com"
+# 备用 API 地址，只应启用一个 llm_api_base 配置项.
+# llm_api_base: "https://api2.wordsofree.de/v1"
+
+# 仅当服务商使用非标准聊天接口路径时，才在此填写完整 URL.
 llm_api_url: ""
+
+# 不要将真实 API 密钥写入此文件，插件会读取下方指定的环境变量.
 llm_api_key: ""
+# 当前启用的 API 密钥环境变量，必须在启动机器人进程前设置.
 llm_api_key_env: "DEEPSEEK_API_KEY"
+# 使用上方备用服务时可改为对应的环境变量.
+# llm_api_key_env: "DAYANZHUZI"
+
+# 当前 API 服务商实际支持的模型名称.
 llm_model: "deepseek-v4-flash"
+# llm_model: "gpt-5.6-terra"
+
+# 单次 LLM 请求的超时时间，单位为秒.
 llm_timeout_seconds: 30
 timezone: "Asia/Shanghai"
 reminder_check_interval: "60s"
@@ -10,3 +25,8 @@ max_pending_todos_per_user: 100
 max_due_reminders_per_check: 20
 reject_past_reminder: true
 permanent_delete_confirmation_ttl_seconds: 300
+proposal_ttl_seconds: 300
+max_proposal_question_rounds: 3
+
+# 群聊中只有 @机器人，或该成员已有待确认提议时才会进入候选追问.
+group_proposal_requires_mention: true

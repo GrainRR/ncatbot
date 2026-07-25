@@ -1,0 +1,63 @@
+# 本文件是可提交的模板。复制为 config.yaml 后，填写所有 <...> 占位符。
+# config.yaml 仅保存于本机；不要提交 QQ 号、WebSocket Token 或 WebUI Token。
+
+bot_uin: "<BOT_QQ_NUMBER>"
+root: "<ADMIN_QQ_NUMBER>"
+debug: false
+enable_webui_interaction: true
+check_ncatbot_update: true
+skip_ncatbot_install_check: false
+skip_napcat_install_confirm: false
+websocket_timeout: 15
+
+# NcatBot 5.5.4 使用 adapters 声明 NapCat 连接；请让地址、端口和令牌
+# 与 NapCat WebUI 中的反向 WebSocket 设置保持一致。
+adapters:
+  - type: napcat
+    platform: qq
+    enabled: true
+    config:
+      ws_uri: "ws://127.0.0.1:3001"
+      ws_token: "<NAPCAT_WEBSOCKET_TOKEN>"
+      webui_uri: "http://127.0.0.1:6099"
+      webui_token: "<NAPCAT_WEBUI_TOKEN>"
+      enable_webui: true
+
+plugin:
+  plugins_dir: "plugins"
+  load_plugin: true
+  plugin_whitelist: []
+  plugin_blacklist: []
+  auto_install_pip_deps: true
+  skip_pip_install_confirm: false
+  hot_reload: true
+  enable_builtin_commands: true
+  builtin_commands:
+    reload: true
+    load: true
+    unload: true
+    sysinfo: true
+    config_toggle: true
+  # 仅建议在私聊中使用框架内置 ! 管理命令。
+  builtin_commands_group_allowed: false
+  # 用户配置只写在这里；密钥使用环境变量名，不写真实值。
+  plugin_configs:
+    todo_reminder:
+      llm_api_base: "https://<LLM_PROVIDER_HOST>/v1"
+      llm_api_key_env: "TODO_REMINDER_LLM_API_KEY"
+      llm_model: "<LLM_MODEL_NAME>"
+      llm_timeout_seconds: 30
+      timezone: "Asia/Shanghai"
+      reminder_check_interval: "60s"
+      max_pending_todos_per_user: 100
+      max_due_reminders_per_check: 20
+      reject_past_reminder: true
+      permanent_delete_confirmation_ttl_seconds: 300
+      proposal_ttl_seconds: 300
+      max_proposal_question_rounds: 3
+      group_proposal_requires_mention: true
+
+logging:
+  event_log_format: "summary"
+  event_log_levels:
+    meta_event: "NONE"

@@ -51,6 +51,19 @@ def format_detail(item: TodoReminder, timezone: ZoneInfo) -> str:
     )
 
 
+def format_concise_reminder(item: TodoReminder, timezone: ZoneInfo) -> str:
+    """渲染固定三行的简洁模式到点提醒文案。"""
+
+    title = _single_line(item.title)
+    raw_text = _single_line(item.raw_text)
+    detail = raw_text or _single_line(item.content or "") or title
+    return (
+        f"待办：[{item.todo_no}]{title}\n"
+        f"待办详情：{detail}\n"
+        f"提醒时间：{format_time(item.remind_at, timezone)}"
+    )
+
+
 def format_inline(item: TodoReminder) -> str:
     """格式化单行标题，并在历史记录上展示稳定 ID。"""
 
@@ -81,3 +94,9 @@ def truncate(text: str, limit: int) -> str:
 
     normalized = text.strip()
     return normalized if len(normalized) <= limit else normalized[: limit - 1] + "..."
+
+
+def _single_line(text: str) -> str:
+    """将用户输入压缩为单行，保证简洁提醒始终只有三行。"""
+
+    return " ".join(text.split())

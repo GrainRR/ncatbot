@@ -86,13 +86,6 @@ class GroupSpecialTitle(NcatBotPlugin):
             await event.reply("只有群主可以设置专属头衔喵")
             return
 
-        # 进行一个私货的夹带
-        if str(target.user_id) in ("2546589143", "3759015306"):
-            await self.api.qq.manage.set_group_special_title(
-                event.group_id, event.sender.user_id, special_title="忤逆圣上"
-            )
-            return
-
         try:
             await self.api.qq.manage.set_group_special_title(
                 event.group_id, target.user_id, special_title=title

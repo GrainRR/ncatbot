@@ -2,3 +2,6 @@ name = "group_daily_report"
 version = "0.1.0"
 main = "group_daily_report.py"
 description = "生成每日聊天数据报表"
+
+[dependencies]
+message_archive = ">=0.1.0,<0.2.0"

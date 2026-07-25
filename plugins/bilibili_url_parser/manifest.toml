@@ -1,5 +1,7 @@
-name = "BilibiliParser"
+name = "bilibili_url_parser"
 version = "1.0.1"
 author = "物起"
 main = "bilibiliurl_parser.py"
+entry_class = "BilibiliUrlParser"
 description = "解析bv号av号url链接b站小程序"
+pip_dependencies = { "bilibili-api-python" = "==17.4.1", aiohttp = "==3.13.5" }

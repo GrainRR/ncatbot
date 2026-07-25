@@ -12,11 +12,11 @@ import aiohttp
 import traceback
 import re
 
-LOG = get_log("BilibiliParser")
+LOG = get_log("bilibili_url_parser")
 
 
 class BilibiliUrlParser(NcatBotPlugin):
-    name = "BilibiliParser"
+    name = "bilibili_url_parser"
     version = "1.0.1"
     author = "物起"
     description = "解析bv号av号url链接b站小程序"

@@ -1,66 +1,89 @@
 # todo_reminder
 
-基于 LLM 解析自然语言的待办提醒插件。
+版本：`0.1.0`。该插件用 OpenAI 兼容的 LLM 接口理解自然语言待办、生成待确认候选，并在到点后私聊提醒创建者。适合私聊待办；群待办默认关闭。
 
-## 功能
+## 前置条件
 
-- 群待办默认关闭；群主或管理员可使用 `#待办 开启` / `#待办 关闭` 切换，开启后群成员可以管理自己的待办。
-- 私聊直接发送自然语言待办，到点私聊提醒创建人。
-- 一句话中明确包含多个独立活动时，可以一次创建多条待办。
-- 待办可以不设置提醒时间，这类待办只会进入列表，不会定时提醒。
-- 使用 SQLite 保存待办数据：`data/todo_reminder/todos.sqlite`。
-- 私聊和已开启群聊中的待办按用户统一归属，共用同一列表、编号和管理范围；不同用户互相隔离。
-- 删除采用软删除；完成、删除、提醒成功后的待办不会再提醒。无论待办来自哪里，到期提醒都只发送到创建人的私聊，私聊发送成功后才标记为已提醒。
+- 已完成 NcatBot、NapCat 和 QQ 初始化；NcatBot `5.5.4`、Python `>=3.12`。
+- 无前置插件和额外 Python 包；使用 Python 标准库访问 LLM。
+- 需要一个支持 `chat/completions` 与工具调用的 OpenAI 兼容 API、可用模型名，以及通过环境变量提供的 API Key。
+- 只有群主或管理员可执行 `#待办 开启` / `#待办 关闭`；群成员只能管理自己的待办。机器人必须能私聊创建者，否则无法投递提醒或候选确认。
 
-## 用法
+## 独立安装与加载验证
+
+```powershell
+$env:NCATBOT_HOME = "<NCATBOT_HOME>"
+Set-Location $env:NCATBOT_HOME
+git clone https://github.com/GrainRR/ncatbot-plugin-todo_reminder.git ".\plugins\todo_reminder"
+& .\.venv\Scripts\ncatbot.exe plugin info todo_reminder
+```
+
+成功信号：`plugin info` 显示 `todo_reminder` `0.1.0` 和入口 `todo_reminder.py`。配置 LLM 后重启框架：
+
+```powershell
+& .\.venv\Scripts\ncatbot.exe run
+```
+
+启动日志应显示待办数据库已就绪。目录存在或 `plugin info` 成功不代表 LLM 已配置。
+
+## 配置与密钥
+
+在框架根目录的 `config.yaml` 配置第三层覆盖；不要把真实 Key 写入 YAML：
+
+```yaml
+plugin:
+  plugin_configs:
+    todo_reminder:
+      llm_api_base: "https://<LLM_PROVIDER_HOST>/v1"
+      llm_api_key_env: "TODO_REMINDER_LLM_API_KEY"
+      llm_model: "<LLM_MODEL_NAME>"
+      llm_timeout_seconds: 30
+      timezone: "Asia/Shanghai"
+      reminder_check_interval: "60s"
+      max_pending_todos_per_user: 100
+      group_proposal_requires_mention: true
+```
+
+仅在启动机器人**同一个 PowerShell 会话**中设置密钥：
+
+```powershell
+$env:TODO_REMINDER_LLM_API_KEY = "<YOUR_LLM_API_KEY>"
+& .\.venv\Scripts\ncatbot.exe run
+```
+
+也可用 `.env.example` 创建本地 `.env` 供你的进程管理器读取，但 NcatBot 本身不会自动加载 `.env`。`plugins/todo_reminder/config.yaml` 是低优先级源码默认值；应把个人选择写入 `plugin.plugin_configs.todo_reminder`，密钥始终只放环境变量。
+
+## 操作与最小验收
+
+私聊机器人后发送：
 
 ```text
-明天十点提醒我开会
+明天上午十点提醒我提交周报
+```
+
+预期：插件给出待办候选和确认提示；回复 `确认`（或单候选时的“好/是”）后，插件创建待办并显示结果。随后发送：
+
+```text
 查看待办
-完成第二条
-取消第二条
-把第二条推迟10分钟
+```
+
+预期输出含刚创建的待办编号。其他常用操作：
+
+```text
+完成第2条
+取消第2条
+把第2条推迟10分钟
 猫娘模式
 简洁模式
 ```
 
-列表中会展示形如 `[3]` 的待办序号。这个序号按 `user_id` 分配，只由当前未完成待办占用；完成、删除或提醒后软删除的待办不会继续占用序号。完成、取消、修改、推迟等操作都使用当前用户的待办序号，因此可在私聊和已开启群聊之间继续管理同一条待办。
+在群里，群主或管理员先发送 `#待办 开启`。默认需要 `@机器人` 才会进入可能需要追问的候选流程；已有候选的同一用户可继续回复。所有到点提醒均私聊创建者，不会在群内广播。
 
-已完成和已取消记录会额外显示不可复用的历史 ID（`H-...`）。恢复和永久删除必须指定这个历史 ID，避免同一序号被复用后误操作历史记录。永久删除分两步：第一次只生成 5 分钟有效的确认令牌，第二次须携带同一历史 ID 与令牌；直接传入 `confirmed=true` 不会删除数据。
+## 数据、更新、卸载与排障
 
-如果 LLM 没有识别到明确提醒时间，会创建普通待办并显示“提醒时间：未设置”。待办提醒成功发送后会自动软删除，从未完成列表中消失。
-
-用户主动取消的待办可按原提醒时间恢复；已经发送过提醒并自动删除的待办，恢复时必须重新设置一个未来提醒时间，避免在下一次扫描中重复发送旧提醒。
-
-如果用户输入包含“先 A 后 B”“A，然后 B”这类明确的多个活动，LLM 会尽可能少地拆分为多条独立待办。没有说明多个活动间隔多久时，提示词要求 LLM 默认按 10 分钟间隔写入各条待办的提醒时间。
-
-## LLM 配置
-
-插件调用 OpenAI 兼容的 `chat/completions` 接口。建议在根 `config.yaml` 的 `plugin.plugin_configs` 中覆盖配置：
-
-```yaml
-plugin:
-  plugin_configs:
-    todo_reminder:
-      llm_api_base: "https://api.openai.com/v1"
-      llm_api_key: "你的 API Key"
-      llm_model: "你的模型名"
-```
-
-也可以不把密钥写入配置文件，而是设置环境变量：
-
-```yaml
-plugin:
-  plugin_configs:
-    todo_reminder:
-      llm_api_base: "https://api.openai.com/v1"
-      llm_api_key_env: "TODO_REMINDER_LLM_API_KEY"
-      max_pending_todos_per_user: 100
-      llm_model: "你的模型名"
-```
-
-如果服务地址不是标准 `/chat/completions`，可以直接设置完整地址：
-
-```yaml
-llm_api_url: "https://example.com/v1/chat/completions"
-```
+- 数据库：`<NCATBOT_HOME>/data/todo_reminder/todos.sqlite`；待确认候选也保存在同一数据库。
+- 更新前停止机器人并备份该 SQLite；在插件目录执行 `git pull --ff-only`，重启后检查迁移和日志。
+- 卸载：先 `ncatbot plugin disable todo_reminder`，备份数据库后删除插件目录。删除目录会使旧数据不可用。
+- “还没有配置 LLM”：检查 `llm_api_base`、`llm_model`、`llm_api_key_env`，并确认当前启动进程确实拥有该环境变量。
+- 候选无法确认：确认在同一私聊/发起群会话中回复，并在候选过期前完成；群聊还需允许机器人私聊你。
+- 提醒未发送：检查机器人能否私聊创建者、`timezone`、到期时间及 `logs/`；不要公开 API Key、数据库或完整聊天日志。

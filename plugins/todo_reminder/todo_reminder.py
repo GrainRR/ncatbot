@@ -20,6 +20,7 @@ from .proposals import (
     render_proposal,
 )
 from .todo_manage_tools import TodoToolContext
+from .todo_manage_tools.presentation import format_concise_reminder
 from .todo_store import (
     MODE_CATGIRL,
     MODE_CONCISE,
@@ -790,7 +791,10 @@ class TodoReminderPlugin(NcatBotPlugin):
             item: 已到期且尚未提醒的待办记录。
         """
 
-        text = item.reminder_text or f"待办提醒：{item.title}"
+        if self._reminder_mode(item.scope, item.group_id, item.user_id) == MODE_CONCISE:
+            text = format_concise_reminder(item, self._timezone())
+        else:
+            text = item.reminder_text or f"待办提醒：{item.title}"
 
         await self.api.qq.send_private_text(item.user_id, text)
         return True
