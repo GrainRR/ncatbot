@@ -28,30 +28,28 @@ py -3.12 --version
 
 ## 3. 从零初始化 NcatBot 框架
 
-请先在准备存放框架的**专用目录**中打开 PowerShell；该目录将成为 NcatBot 的运行目录。以下命令以 `$env:NCATBOT_HOME` 表示这个目录。它只在当前 PowerShell 窗口有效，关闭窗口后需重新设置。`$TinglanSource` 仅用于取得本仓库的安全配置模板和插件文档；它不是运行目录。
+请先在准备存放框架的**专用目录**中打开 PowerShell；该目录将成为 NcatBot 的运行目录。以下命令以 `$env:NCATBOT_HOME` 表示这个目录。它只在当前 PowerShell 窗口有效，关闭窗口后需重新设置。本节**只安装并初始化 NcatBot 框架**，不会下载任何本插件集或插件源码。
 
 ```powershell
 $env:NCATBOT_HOME = (Get-Location).Path
-$TinglanSource = Join-Path (Split-Path -Parent $env:NCATBOT_HOME) "ncatbot-tinglan"
-git clone https://github.com/GrainRR/ncatbot.git $TinglanSource
 py -3.12 -m venv .venv
-& .\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-python -m pip install "ncatbot5==5.5.4"
-ncatbot init --dir $env:NCATBOT_HOME
-Copy-Item "$TinglanSource\config.example.yaml" ".\config.yaml" -Force
+& .\.venv\Scripts\python.exe -m pip install "ncatbot5==5.5.4"
+& .\.venv\Scripts\ncatbot.exe init --dir $env:NCATBOT_HOME
 ```
+
+不必执行 `Activate.ps1`；后续 Python 和 NcatBot 命令都直接调用 `.venv\Scripts` 中的可执行文件，因此不会受 PowerShell 脚本执行策略影响。
+
+`ncatbot init` 可能在 `plugins/` 中生成 NcatBot 自带的示例插件；它是框架脚手架，不是第 5 节中的任一可选插件。
 
 初始化时，`ncatbot init` 会询问机器人 QQ、管理员 QQ 和适配器；可先留空/使用默认值，因为下一步会用模板覆盖配置。然后编辑 `config.yaml`，替换全部 `<...>` 占位符，至少填写机器人 QQ、管理员 QQ、WebSocket Token 和 WebUI Token。
 
 | 步骤 | 成功信号 | 失败时查看 |
 | --- | --- | --- |
 | 选择运行目录 | `$env:NCATBOT_HOME` 显示当前目录 | 确认在专用目录中打开了 PowerShell；不要与其他项目混用 |
-| 克隆模板仓库 | 出现 `$TinglanSource\config.example.yaml` | Git 地址、代理和本地目录权限 |
 | 创建虚拟环境 | 出现 `$env:NCATBOT_HOME\.venv` | Python 版本与执行策略 |
-| 安装框架 | `ncatbot --version` 显示 `5.5.4` | `python -m pip show ncatbot5` |
-| 初始化项目 | 出现 `$env:NCATBOT_HOME\plugins` | `ncatbot init --help` 与当前目录 |
-| 复制模板 | 出现本地 `config.yaml` | 模板源路径与文件权限 |
+| 安装框架 | `& .\.venv\Scripts\ncatbot.exe --version` 显示 `5.5.4` | `& .\.venv\Scripts\python.exe -m pip show ncatbot5` |
+| 初始化项目 | 出现 `$env:NCATBOT_HOME\plugins` | `& .\.venv\Scripts\ncatbot.exe init --help` 与当前目录 |
+| 生成框架配置 | 出现本地 `config.yaml` | 根据交互提示检查机器人 QQ、管理员 QQ 和适配器配置 |
 
 不要提交 `config.yaml`。如果仓库历史中曾提交过真实 Token 或 LLM Key，请在对应服务端撤销并重新生成；仅删除文件不足以轮换密钥。
 
@@ -59,14 +57,9 @@ Copy-Item "$TinglanSource\config.example.yaml" ".\config.yaml" -Force
 
 ```bash
 export NCATBOT_HOME="$PWD"
-export TINGLAN_SOURCE="$(dirname "$NCATBOT_HOME")/ncatbot-tinglan"
-git clone https://github.com/GrainRR/ncatbot.git "$TINGLAN_SOURCE"
 python3.12 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-python -m pip install "ncatbot5==5.5.4"
-ncatbot init --dir "$NCATBOT_HOME"
-cp "$TINGLAN_SOURCE/config.example.yaml" "$NCATBOT_HOME/config.yaml"
+"$NCATBOT_HOME/.venv/bin/python" -m pip install "ncatbot5==5.5.4"
+"$NCATBOT_HOME/.venv/bin/ncatbot" init --dir "$NCATBOT_HOME"
 ```
 
 ## 4. 配置 NapCat 与 QQ 连接
@@ -90,7 +83,7 @@ cp "$TINGLAN_SOURCE/config.example.yaml" "$NCATBOT_HOME/config.yaml"
 
 ## 5. 按需逐个安装插件
 
-不要一次安装全部插件。选择一个插件后，打开其独立 README，执行其中的克隆、虚拟环境依赖安装、加载验证与最小功能验证。日报的唯一前置链是：
+完成第 3、4 节并确认框架和 NapCat 连接成功后，才进入本节安装插件。不要一次安装全部插件。选择一个插件后，打开其独立 README，执行其中的克隆、虚拟环境依赖安装、加载验证与最小功能验证。日报的唯一前置链是：
 
 ```text
 message_archive → group_daily_report
@@ -114,6 +107,8 @@ message_archive → group_daily_report
 1. 框架本地 `config.yaml`：QQ、NapCat、日志和全局插件开关；
 2. `plugin.plugin_configs.<plugin_name>`：插件的用户覆盖配置；
 3. 进程环境变量：仅存放 LLM API Key 等密钥。
+
+第 3 节的 `ncatbot init` 已创建本机的 `config.yaml`。本仓库的 `config.example.yaml` 只作为受版本控制的脱敏结构参考；首次安装框架时不需要下载它，也不要用它覆盖已经填好的本机配置。
 
 待办插件的安全配置示例：
 
@@ -143,21 +138,21 @@ Set-Location $env:NCATBOT_HOME
 & .\.venv\Scripts\ncatbot.exe run
 ```
 
-停止使用 `Ctrl+C`。重启是停止后再次执行 `ncatbot run`；开发期可使用 `ncatbot dev`。查看日志：
+停止使用 `Ctrl+C`。重启是停止后再次执行 `& .\.venv\Scripts\ncatbot.exe run`；开发期可使用 `& .\.venv\Scripts\ncatbot.exe dev`。查看日志：
 
 ```powershell
 Get-ChildItem .\logs\*.log -ErrorAction SilentlyContinue | Get-Content -Tail 200 -Wait
 ```
 
-每安装一个插件都要完成以下闭环：目录为预期路径；`ncatbot plugin list` 能识别名称；启动日志显示插件已加载；执行插件 README 中的最小动作；日志没有依赖或配置错误。**目录存在不等于插件已成功加载。**
+每安装一个插件都要完成以下闭环：目录为预期路径；`& .\.venv\Scripts\ncatbot.exe plugin list` 能识别名称；启动日志显示插件已加载；执行插件 README 中的最小动作；日志没有依赖或配置错误。**目录存在不等于插件已成功加载。**
 
 ## 8. 常见故障排查
 
 | 症状 | 检查位置/命令 | 修复动作 |
 | --- | --- | --- |
-| 框架无法启动 | `ncatbot --version`、`ncatbot config check`、`logs/` | 激活 `.venv`，确认 Python 3.12+，修正配置占位符 |
-| NapCat 未连接 | `ncatbot napcat diagnose webui`、`ncatbot napcat diagnose ws` | 让 URI、端口、Token 与 NapCat WebUI 一致并重新登录 QQ |
-| 插件未加载 | `ncatbot plugin list`、启动日志、`manifest.toml` | 检查目录、`main`、插件黑名单和依赖 |
+| 框架无法启动 | `& .\.venv\Scripts\ncatbot.exe --version`、`& .\.venv\Scripts\ncatbot.exe config check`、`logs/` | 确认 `.venv` 存在、Python 3.12+，修正配置占位符 |
+| NapCat 未连接 | `& .\.venv\Scripts\ncatbot.exe napcat diagnose webui`、`& .\.venv\Scripts\ncatbot.exe napcat diagnose ws` | 让 URI、端口、Token 与 NapCat WebUI 一致并重新登录 QQ |
+| 插件未加载 | `& .\.venv\Scripts\ncatbot.exe plugin list`、启动日志、`manifest.toml` | 检查目录、`main`、插件黑名单和依赖 |
 | 缺少 Python 依赖 | 启动日志和插件 README | 用 `$env:NCATBOT_HOME\.venv\Scripts\python.exe -m pip install ...` 安装 |
 | 群权限不足 | 群角色与 NapCat/API 错误日志 | 授予机器人所需群管理权限，再由正确的群主/管理员重试 |
 | 日报无数据 | `data/message_archive/messages.sqlite`、归档插件日志 | 先加载归档插件并产生群消息后再执行日报 |
@@ -173,7 +168,7 @@ git fetch --tags
 git pull --ff-only
 ```
 
-回退前记录可工作的 commit/tag：`git log --oneline --decorate -20`，再执行 `git checkout <KNOWN_GOOD_TAG_OR_COMMIT>`。卸载前先 `ncatbot plugin disable <plugin_name>`，备份数据后才删除对应插件目录。
+回退前记录可工作的 commit/tag：`git log --oneline --decorate -20`，再执行 `git checkout <KNOWN_GOOD_TAG_OR_COMMIT>`。卸载前先执行 `& .\.venv\Scripts\ncatbot.exe plugin disable <plugin_name>`，备份数据后才删除对应插件目录。
 
 SQLite 备份应在机器人停止后进行，例如：
 
