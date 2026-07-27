@@ -21,7 +21,7 @@ PowerShell 预检：
 
 ```powershell
 git --version
-py -3.12 --version
+python --version
 ```
 
 成功信号：两条命令均返回版本号。失败时：安装 Git，或安装/修复 64 位 Python 3.12+ 后重新打开 PowerShell。
@@ -32,16 +32,16 @@ py -3.12 --version
 
 ```powershell
 $env:NCATBOT_HOME = (Get-Location).Path
-py -3.12 -m venv .venv
+python -m venv .venv
 & .\.venv\Scripts\python.exe -m pip install "ncatbot5==5.5.4"
 & .\.venv\Scripts\ncatbot.exe init --dir $env:NCATBOT_HOME
 ```
 
-不必执行 `Activate.ps1`；后续 Python 和 NcatBot 命令都直接调用 `.venv\Scripts` 中的可执行文件，因此不会受 PowerShell 脚本执行策略影响。
-
 `ncatbot init` 可能在 `plugins/` 中生成 NcatBot 自带的示例插件；它是框架脚手架，不是第 5 节中的任一可选插件。
 
-初始化时，`ncatbot init` 会询问机器人 QQ、管理员 QQ 和适配器；可先留空/使用默认值，因为下一步会用模板覆盖配置。然后编辑 `config.yaml`，替换全部 `<...>` 占位符，至少填写机器人 QQ、管理员 QQ、WebSocket Token 和 WebUI Token。
+初始化时，`ncatbot init` 会询问机器人 QQ、管理员 QQ 和适配器；可先留空/使用默认值，但必须在配置 NapCat 前编辑本机 `config.yaml`，填写自己的机器人 QQ、管理员 QQ、WebSocket Token 和 WebUI Token。
+
+如果初始化界面显示“AI 适配器配置”（OpenAI、DeepSeek、Qwen、Kimi 等），请跳过或留空。本项目的待办 LLM 只在安装 `todo_reminder` 后，按其独立 README 配置；该项不是 NapCat 连接配置。
 
 | 步骤 | 成功信号 | 失败时查看 |
 | --- | --- | --- |
@@ -63,6 +63,8 @@ python3.12 -m venv .venv
 ```
 
 ## 4. 配置 NapCat 与 QQ 连接
+
+`ncatbot init` 只初始化 NcatBot 项目和适配器配置；它**不会**下载、安装或登录 NapCat/QQ。全新机器仍必须执行下面的安装命令。若你已自行安装并登录 NapCat，可跳过该命令，直接核对 WebUI 和 WebSocket 配置。
 
 在 `$env:NCATBOT_HOME` 中执行：
 
@@ -106,26 +108,11 @@ message_archive → group_daily_report
 
 1. 框架本地 `config.yaml`：QQ、NapCat、日志和全局插件开关；
 2. `plugin.plugin_configs.<plugin_name>`：插件的用户覆盖配置；
-3. 进程环境变量：仅存放 LLM API Key 等密钥。
+3. 进程环境变量：仅存放插件 API Key 等密钥。
 
 第 3 节的 `ncatbot init` 已创建本机的 `config.yaml`。本仓库的 `config.example.yaml` 只作为受版本控制的脱敏结构参考；首次安装框架时不需要下载它，也不要用它覆盖已经填好的本机配置。
 
-待办插件的安全配置示例：
-
-```yaml
-plugin:
-  plugin_configs:
-    todo_reminder:
-      llm_api_base: "https://<LLM_PROVIDER_HOST>/v1"
-      llm_api_key_env: "TODO_REMINDER_LLM_API_KEY"
-      llm_model: "<LLM_MODEL_NAME>"
-```
-
-复制 `.env.example` 为 `.env` 只是在本机保存变量名和值；NcatBot 不会自动加载 `.env`。启动前需由 PowerShell、服务管理器或密钥管理器导入变量。例如仅对当前 PowerShell 会话：
-
-```powershell
-$env:TODO_REMINDER_LLM_API_KEY = "<YOUR_LLM_API_KEY>"
-```
+插件专属配置、环境变量名称和密钥导入方式只在对应插件 README 中维护；例如待办插件的 LLM 配置在 [todo_reminder README](plugins/todo_reminder/README.md)。`.env` 仅是本机保存变量的可选方式，NcatBot 不会自动加载它。
 
 下列文件只在本机保存，绝不提交：`config.yaml`、`.env`、`data/`、`logs/`、`napcat/`。
 
@@ -156,7 +143,7 @@ Get-ChildItem .\logs\*.log -ErrorAction SilentlyContinue | Get-Content -Tail 200
 | 缺少 Python 依赖 | 启动日志和插件 README | 用 `$env:NCATBOT_HOME\.venv\Scripts\python.exe -m pip install ...` 安装 |
 | 群权限不足 | 群角色与 NapCat/API 错误日志 | 授予机器人所需群管理权限，再由正确的群主/管理员重试 |
 | 日报无数据 | `data/message_archive/messages.sqlite`、归档插件日志 | 先加载归档插件并产生群消息后再执行日报 |
-| 待办未配置 LLM | `plugin.plugin_configs.todo_reminder`、环境变量 | 设置地址、模型和 `TODO_REMINDER_LLM_API_KEY`，重启后验证 |
+| 待办未配置 LLM | [todo_reminder README](plugins/todo_reminder/README.md)、启动日志 | 按插件 README 配置后重启并验证 |
 | WebUI/WebSocket 错误 | 两个 `napcat diagnose` 命令 | 不在日志中暴露 Token，改正 URI/Token 后重试 |
 
 ## 9. 更新、卸载与数据备份

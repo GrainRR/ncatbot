@@ -28,6 +28,8 @@ git clone https://github.com/GrainRR/ncatbot-plugin-todo_reminder.git ".\plugins
 
 ## 配置与密钥
 
+这是待办插件自己的 LLM 配置，不是 NcatBot 初始化或 NapCat 的“AI 适配器配置”。请先完成本插件的克隆，再在此处配置模型地址、模型名和密钥变量。
+
 在框架根目录的 `config.yaml` 配置第三层覆盖；不要把真实 Key 写入 YAML：
 
 ```yaml
