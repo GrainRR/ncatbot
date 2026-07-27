@@ -1,36 +1,19 @@
 # todo_reminder
 
-版本：`0.1.0`。该插件用 OpenAI 兼容的 LLM 接口理解自然语言待办、生成待确认候选，并在到点后私聊提醒创建者。适合私聊待办；群待办默认关闭。
+## 基本介绍
 
-## 前置条件
+通过 OpenAI 兼容的 LLM 理解自然语言待办，生成待确认候选，并在到点后私聊提醒创建者。默认仅在私聊中使用待办。
 
-- 已完成 NcatBot、NapCat 和 QQ 初始化；NcatBot `5.5.4`、Python `>=3.12`。
-- 无前置插件和额外 Python 包；使用 Python 标准库访问 LLM。
-- 需要一个支持 `chat/completions` 与工具调用的 OpenAI 兼容 API、可用模型名，以及通过环境变量提供的 API Key。
-- 只有群主或管理员可执行 `#待办 开启` / `#待办 关闭`；群成员只能管理自己的待办。机器人必须能私聊创建者，否则无法投递提醒或候选确认。
+## 获取方式
 
-## 独立安装与加载验证
+本插件仅随本项目 Release 分发。请下载与项目版本匹配的发布包，并按发布包附带的部署说明安装；无需单独克隆插件仓库。
 
-```powershell
-$env:NCATBOT_HOME = "<NCATBOT_HOME>"
-Set-Location $env:NCATBOT_HOME
-git clone https://github.com/GrainRR/ncatbot-plugin-todo_reminder.git ".\plugins\todo_reminder"
-& .\.venv\Scripts\ncatbot.exe plugin info todo_reminder
-```
+## 前置依赖
 
-成功信号：`plugin info` 显示 `todo_reminder` `0.1.0` 和入口 `todo_reminder.py`。配置 LLM 后重启框架：
-
-```powershell
-& .\.venv\Scripts\ncatbot.exe run
-```
-
-启动日志应显示待办数据库已就绪。目录存在或 `plugin info` 成功不代表 LLM 已配置。
-
-## 配置与密钥
-
-这是待办插件自己的 LLM 配置，不是 NcatBot 初始化或 NapCat 的“AI 适配器配置”。请先完成本插件的克隆，再在此处配置模型地址、模型名和密钥变量。
-
-在框架根目录的 `config.yaml` 配置第三层覆盖；不要把真实 Key 写入 YAML：
+- 运行环境：已完成 NcatBot、NapCat 和 QQ 初始化，且机器人能够私聊待办创建者以发送提醒。
+- 软件包：无额外 Python 软件包依赖；待办数据使用 Python 自带的 SQLite。
+- 其他插件：无。
+- 外部服务与配置：必须具备支持 `chat/completions` 和工具调用的 OpenAI 兼容 LLM 服务、对应的 API Key 和模型名称；请在框架根目录的 `config.yaml` 添加以下插件配置。不要把真实 Key 写入 YAML：
 
 ```yaml
 plugin:
@@ -39,53 +22,25 @@ plugin:
       llm_api_base: "https://<LLM_PROVIDER_HOST>/v1"
       llm_api_key_env: "TODO_REMINDER_LLM_API_KEY"
       llm_model: "<LLM_MODEL_NAME>"
-      llm_timeout_seconds: 30
-      timezone: "Asia/Shanghai"
-      reminder_check_interval: "60s"
-      max_pending_todos_per_user: 100
-      group_proposal_requires_mention: true
 ```
 
-仅在启动机器人**同一个 PowerShell 会话**中设置密钥：
+在启动机器人的同一个 PowerShell 会话中设置密钥并启动：
 
 ```powershell
 $env:TODO_REMINDER_LLM_API_KEY = "<YOUR_LLM_API_KEY>"
 & .\.venv\Scripts\ncatbot.exe run
 ```
 
-也可用 `.env.example` 创建本地 `.env` 供你的进程管理器读取，但 NcatBot 本身不会自动加载 `.env`。`plugins/todo_reminder/config.yaml` 是低优先级源码默认值；应把个人选择写入 `plugin.plugin_configs.todo_reminder`，密钥始终只放环境变量。
+启动日志没有 LLM 或数据库错误即表示配置完成。
 
-## 操作与最小验收
+## 使用方式
 
-私聊机器人后发送：
+私聊机器人发送：
 
 ```text
 明天上午十点提醒我提交周报
 ```
 
-预期：插件给出待办候选和确认提示；回复 `确认`（或单候选时的“好/是”）后，插件创建待办并显示结果。随后发送：
+机器人给出候选后回复 `确认`（或单候选时回复“好”或“是”）来创建待办；发送 `查看待办` 查看结果。
 
-```text
-查看待办
-```
-
-预期输出含刚创建的待办编号。其他常用操作：
-
-```text
-完成第2条
-取消第2条
-把第2条推迟10分钟
-猫娘模式
-简洁模式
-```
-
-在群里，群主或管理员先发送 `#待办 开启`。默认需要 `@机器人` 才会进入可能需要追问的候选流程；已有候选的同一用户可继续回复。所有到点提醒均私聊创建者，不会在群内广播。
-
-## 数据、更新、卸载与排障
-
-- 数据库：`<NCATBOT_HOME>/data/todo_reminder/todos.sqlite`；待确认候选也保存在同一数据库。
-- 更新前停止机器人并备份该 SQLite；在插件目录执行 `git pull --ff-only`，重启后检查迁移和日志。
-- 卸载：先 `ncatbot plugin disable todo_reminder`，备份数据库后删除插件目录。删除目录会使旧数据不可用。
-- “还没有配置 LLM”：检查 `llm_api_base`、`llm_model`、`llm_api_key_env`，并确认当前启动进程确实拥有该环境变量。
-- 候选无法确认：确认在同一私聊/发起群会话中回复，并在候选过期前完成；群聊还需允许机器人私聊你。
-- 提醒未发送：检查机器人能否私聊创建者、`timezone`、到期时间及 `logs/`；不要公开 API Key、数据库或完整聊天日志。
+群待办默认关闭。群主或管理员可发送 `#待办 开启` 或 `#待办 关闭`；群成员只能管理自己的待办。机器人还必须能私聊创建者，才能发送提醒。
