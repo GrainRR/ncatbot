@@ -5,24 +5,6 @@ from ncatbot.plugin import NcatBotPlugin
 from ncatbot.types import At
 
 
-def _get_halfwidth_units(text: str) -> int:
-    """计算文本占用的半角字符单位数。
-
-    Args:
-        text: 需要计算长度的文本。
-
-    Returns:
-        文本占用的半角字符单位数。ASCII 字符计 1，非 ASCII 字符计 2。
-    """
-
-    units = 0
-
-    for char in text:
-        units += 1 if ord(char) < 128 else 2
-
-    return units
-
-
 class GroupSpecialTitle(NcatBotPlugin):
     name = "group_special_title"
     version = "0.1.0"
@@ -30,8 +12,12 @@ class GroupSpecialTitle(NcatBotPlugin):
     description = "设置群成员专属头衔"
 
     @registrar.qq.on_group_command("#申请头衔")
-    async def apply_special_title(self, event: GroupMessageEvent, title: str = ""):
-        """处理群主设置自己专属头衔的命令。
+    async def apply_special_title(
+            self,
+            event: GroupMessageEvent,
+            title: str = ""
+    ):
+        """处理群成员申请自己专属头衔的命令。
 
         Args:
             event: 触发命令的群消息事件。
@@ -47,7 +33,7 @@ class GroupSpecialTitle(NcatBotPlugin):
             return
 
         if not await self._can_set_special_title(event):
-            await event.reply("只有群主可以设置专属头衔喵")
+            await event.reply("机器人需要是本群群主才能设置专属头衔喵")
             return
 
         try:
@@ -67,7 +53,7 @@ class GroupSpecialTitle(NcatBotPlugin):
             target: At = None,
             title: str = ""
     ):
-        """处理群主为群成员发放专属头衔的命令。
+        """处理管理员为群成员发放专属头衔的命令。
 
         Args:
             event: 触发命令的群消息事件。
@@ -83,7 +69,11 @@ class GroupSpecialTitle(NcatBotPlugin):
             return
 
         if not await self._can_set_special_title(event):
-            await event.reply("只有群主可以设置专属头衔喵")
+            await event.reply("机器人需要是本群群主才能设置专属头衔喵")
+            return
+
+        if not await self._is_sender_admin(event):
+            await event.reply("只有管理员可以为群成员发放专属头衔喵")
             return
 
         try:
@@ -95,23 +85,55 @@ class GroupSpecialTitle(NcatBotPlugin):
             await event.reply(f"❌ 为 {target.user_id} 设置头衔「{title}」失败了喵")
 
     async def _can_set_special_title(self, event: GroupMessageEvent) -> bool:
-        """判断当前命令发送者是否为群主。
+        """判断机器人账号是否为当前群的群主。
 
         Args:
-            event: 触发命令的群消息事件，用于获取当前群号和命令发送者 QQ 号。
+            event: 触发命令的群消息事件，用于获取当前群号和机器人 QQ 号。
 
         Returns:
-            命令发送者是当前群群主时返回 True；命令发送者不是群主，
+            机器人是当前群群主时返回 True；机器人不是群主，
             或查询群成员信息失败时返回 False。
         """
 
         try:
+            # 调用QQ官方接口查询机器人的 role
             member_info = await self.api.qq.query.get_group_member_info(
                 group_id=event.group_id,
-                user_id=event.sender.user_id,
+                user_id=event.self_id,
             )
         except Exception as exc:
-            self.logger.exception("查询群成员权限失败: %s", exc)
+            self.logger.exception("查询机器人群权限失败: %s", exc)
             return False
 
         return getattr(member_info, "role", None) == "owner"
+
+    async def _is_sender_admin(self, event: GroupMessageEvent) -> bool:
+        """判断命令发送者是否为当前群管理员。"""
+
+        try:
+            member_info = await self.api.qq.query.get_group_member_info(
+                group_id=event.group_id,
+                user_id=event.user_id,
+            )
+        except Exception as exc:
+            self.logger.exception("查询命令发送者群权限失败: %s", exc)
+            return False
+
+        return getattr(member_info, "role", None) == "admin"
+
+def _get_halfwidth_units(text: str) -> int:
+    """计算文本占用的半角字符单位数。
+
+    Args:
+        text: 需要计算长度的文本。
+
+    Returns:
+        文本占用的半角字符单位数。ASCII 字符计 1，非 ASCII 字符计 2。
+    """
+
+    units = 0
+
+    for char in text:
+        units += 1 if ord(char) < 128 else 2
+
+    return units
